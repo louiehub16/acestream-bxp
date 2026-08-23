@@ -10,6 +10,8 @@ Control plane for bulk music generation on SaladCloud RTX 5090 nodes:
     watch      live progress (R2 _done markers + queue stats)
     down       delete group -> billing stops
     logs       tail Salad system logs (event-level)
+    retry      reset failed jobs (R2 _failed markers) back to pending
+    delete     wipe a session prefix from R2
     run        full pipeline: validate->enqueue->up->watch->down
 
 Requires: requests, boto3   (pip install requests boto3)
@@ -44,6 +46,9 @@ SALAD_BASE = "https://api.salad.com/api/public"
 SALAD_ORG = "lucas16"
 SALAD_PROJECT = "default"
 GPU_5090 = "851399fb-7329-4195-a042-d6514b28cf33"  # RTX 5090 (32 GB) in org lucas16
+# RTX 4090 (24 GB): faster to allocate; acestep-v15-xl fits in 24 GB. Set via
+# GPU_CLASSES env (comma-separated) to add it as a fallback pool.
+GPU_4090 = "ed563892-aacd-40f5-80b7-90c9be6c759b"
 ACCOUNT_ID = "abd12cd58366e2d99a202218328b1340"
 FALLBACK_PROMPT = "Cinematic industrial background layer"
 DURATION_MIN, DURATION_MAX = 10, 600
@@ -68,6 +73,20 @@ ENV = load_env()
 
 def env_get(key: str, default: str = "") -> str:
     return os.environ.get(key) or ENV.get(key) or default
+
+
+def gpu_classes() -> list[str]:
+    """Salad GPU class UUIDs for the create payload.
+
+    GPU_CLASSES env (comma-separated UUIDs) overrides; empty -> 5090 pool only.
+    Example: GPU_CLASSES=851399fb-...,ed563892-...  (4090 as faster-allocate
+    fallback - acestep-v15-xl fits its 24 GB).
+    """
+    raw = env_get("GPU_CLASSES").strip()
+    if not raw:
+        return [GPU_5090]
+    classes = [c.strip() for c in raw.split(",") if c.strip()]
+    return classes or [GPU_5090]
 
 
 def r2_endpoint_defaulted() -> str:
@@ -104,7 +123,7 @@ def salad_create_group(name: str, image: str, replicas: int, node_env: dict,
             "resources": {
                 "cpu": 8,
                 "memory": 32768,
-                "gpu_classes": [GPU_5090],   # snake_case or GPUs silently vanish
+                "gpu_classes": gpu_classes(),  # snake_case or GPUs silently vanish
                 "shm_size": 64,
             },
             "networking": {"port": 8001, "auth": False, "protocol": "http"},
@@ -240,6 +259,194 @@ def count_done_markers(bucket: str, session: str) -> tuple[int, list[str]]:
             recent.append((obj.get("LastModified"), obj["Key"]))
     recent.sort(reverse=True)
     return n, [k.rsplit("/", 1)[-1].removesuffix(".json") for _, k in recent[:5]]
+
+
+# ---------------------------------------------------------------- kanban hook
+# Optional progress feed to an external kanban board (dispatcher/kanban_hook.py).
+# Import works both as a script (sys.path[0] = dispatcher/) and as a package.
+try:
+    from kanban_hook import post_progress  # type: ignore
+except ImportError:  # pragma: no cover - depends on how dispatch.py is loaded
+    try:
+        from dispatcher.kanban_hook import post_progress  # type: ignore
+    except ImportError:
+        def post_progress(session: str, stats: dict) -> bool:  # type: ignore[misc]
+            return False  # hook file missing -> feature silently off
+
+
+# ---------------------------------------------------------------- completion report / delete
+def r2_delete_prefix(bucket: str, session: str) -> tuple[int, int]:
+    """Delete every object under <session>/ (chunks of 1000).
+
+    Returns (deleted_count, freed_bytes).
+    """
+    c = r2_client()
+    paginator = c.get_paginator("list_objects_v2")
+    deleted, freed, batch = 0, 0, []
+
+    def flush() -> None:
+        nonlocal deleted
+        if not batch:
+            return
+        resp = c.delete_objects(Bucket=bucket,
+                                Delete={"Quiet": True, "Objects": batch})
+        deleted += len(batch) - len(resp.get("Errors", []))
+        batch.clear()
+
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{session}/"):
+        for obj in page.get("Contents", []):
+            batch.append({"Key": obj["Key"]})
+            freed += obj.get("Size", obj.get("ContentLength", 0)) or 0
+            if len(batch) >= 1000:
+                flush()
+    flush()
+    return deleted, freed
+
+
+_REPORTED_SESSIONS: set[tuple[str, str]] = set()
+
+
+def finish_session_report(bucket: str, session: str,
+                          no_delete: bool = False) -> None:
+    """End-of-session R2 stats + interactive offer to wipe the prefix.
+
+    Prints the dashboard browse link, audio count (= _done markers), total GB
+    and any non-wav stragglers; then prompts before deleting the whole
+    <session>/ prefix. Skipped entirely if already reported this process
+    (`run` -> `watch` would otherwise double-report), when --no-delete is set,
+    or when stdin is not a TTY.
+    """
+    key = (bucket, session)
+    if key in _REPORTED_SESSIONS:
+        return
+    _REPORTED_SESSIONS.add(key)
+
+    c = r2_client()
+    total_bytes, n_files, non_wav = 0, 0, 0
+    paginator = c.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{session}/"):
+        for obj in page.get("Contents", []):
+            total_bytes += obj.get("Size", obj.get("ContentLength", 0)) or 0
+            n_files += 1
+            if not obj["Key"].endswith(".wav") and "/_done/" not in obj["Key"]:
+                non_wav += 1
+    done, _ = count_done_markers(bucket, session)
+
+    print(browse_link(session))
+    print(f"audio files : {done}")
+    print(f"total size  : {total_bytes / 1024 ** 3:.2f} GB "
+          f"across {n_files} object(s)")
+    if non_wav:
+        print(f"non-wav     : {non_wav} object(s) - inspect if unexpected")
+    if not n_files or no_delete or not sys.stdin.isatty():
+        return
+    try:
+        ans = input(f"Delete these {n_files} files from R2? [y/N] ")
+    except EOFError:
+        return
+    if ans.strip().lower() != "y":
+        print("kept R2 objects")
+        return
+    deleted, freed = r2_delete_prefix(bucket, session)
+    print(f"freed {freed / 1024 ** 3:.2f} GB ({deleted} object(s) deleted)")
+
+
+def cmd_delete(args) -> int:
+    """Standalone `delete --session S`: wipe <S>/ from R2, no report."""
+    bucket = env_get("R2_BUCKET_NAME")
+    if not bucket:
+        print("R2_BUCKET_NAME not set in .env", file=sys.stderr)
+        return EXIT_CONFIG
+    if not args.force:
+        if not sys.stdin.isatty():
+            print("refusing to delete without --force in a non-interactive shell",
+                  file=sys.stderr)
+            return EXIT_CONFIG
+        try:
+            ans = input(f"Delete ALL R2 objects under '{args.session}/'? [y/N] ")
+        except EOFError:
+            print("non-interactive shell: re-run with --force", file=sys.stderr)
+            return EXIT_CONFIG
+        if ans.strip().lower() != "y":
+            print("aborted")
+            return EXIT_OK
+    try:
+        deleted, freed = r2_delete_prefix(bucket, args.session)
+    except Exception as e:  # noqa: BLE001
+        print(f"delete failed: {e}", file=sys.stderr)
+        return EXIT_API
+    print(f"deleted {deleted} object(s); freed {freed / 1024 ** 3:.2f} GB")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- retry
+def list_failed_markers(bucket: str, session: str) -> list[tuple[str, str]]:
+    """[(filename, error[:60])] for every <session>/_failed/ marker (paginated)."""
+    c = r2_client()
+    out: list[tuple[str, str]] = []
+    paginator = c.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{session}/_failed/"):
+        for obj in page.get("Contents", []):
+            name = obj["Key"].rsplit("/", 1)[-1].removesuffix(".json")
+            err = ""
+            try:
+                body = c.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
+                err = str(json.loads(body).get("error", ""))[:60]
+            except Exception:  # noqa: BLE001 - unreadable marker still gets listed
+                pass
+            out.append((name, err))
+    return out
+
+
+def queue_retry(session: str, filenames: list[str]) -> dict:
+    headers = {"X-Admin-Key": env_get("ADMIN_KEY"),
+               "Content-Type": "application/json"}
+    if len(filenames) > 500:
+        body: dict = {"session": session, "all": True}
+    else:
+        body = {"session": session, "filenames": filenames}
+    r = retry_call(lambda: requests.post(f"{queue_base()}/retry", headers=headers,
+                                         data=json.dumps(body), timeout=120),
+                   what="queue-retry")
+    r.raise_for_status()
+    try:
+        return r.json()
+    except ValueError:
+        return {}
+
+
+def cmd_retry(args) -> int:
+    bucket = env_get("R2_BUCKET_NAME")
+    session = args.session
+    try:
+        failed = list_failed_markers(bucket, session)
+    except Exception as e:  # noqa: BLE001
+        print(f"R2 listing failed: {e}", file=sys.stderr)
+        return EXIT_API
+    if not failed:
+        print("nothing failed - no _failed markers for this session")
+        return EXIT_OK
+
+    table([("filename", "error")] + failed)
+    if not args.yes:
+        try:
+            ans = input(f"\nreset {len(failed)} failed job(s) to pending? [y/N] ")
+        except EOFError:
+            print("non-interactive shell: re-run with --yes to skip the prompt",
+                  file=sys.stderr)
+            return EXIT_CONFIG
+        if ans.strip().lower() != "y":
+            print("aborted")
+            return EXIT_OK
+    try:
+        res = queue_retry(session, [n for n, _ in failed])
+    except Exception as e:  # noqa: BLE001
+        print(f"retry call failed: {e}", file=sys.stderr)
+        return EXIT_API
+    reset = res.get("reset", res.get("updated", len(failed)))
+    print(f"reset {reset} job(s) to pending (attempts=0); nodes will re-claim them")
+    print(f"next: python {Path(__file__).name} watch --session {session}")
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------- csv parsing
@@ -406,7 +613,8 @@ def cmd_enqueue(args) -> int:
 def build_node_env() -> dict:
     keys = ["QUEUE_BASE_URL", "ADMIN_KEY", "R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID",
             "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME",
-            "JOB_TIMEOUT_SECONDS", "MAX_RUNTIME_SECONDS"]
+            "JOB_TIMEOUT_SECONDS", "MAX_RUNTIME_SECONDS",
+            "OUTPUT_FORMAT"]  # sidecar upload container (wav/flac/mp3)
     node_env = {}
     for k in keys:
         v = env_get(k)
@@ -505,10 +713,14 @@ def cmd_watch(args) -> int:
               f"claimed={claimed} | elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m")
         if recent:
             print(f"  latest: {', '.join(recent)}")
+        if env_get("KANBAN_PROGRESS_URL"):
+            post_progress(session, {"done": done, "failed": failed,
+                                    "pending": pending, "claimed": claimed,
+                                    "total": total})
         if total and done + failed >= total:
             print("=" * 62)
             print(f"SESSION COMPLETE: ok={done} failed={failed}")
-            print(browse_link(session))
+            finish_session_report(bucket, session, no_delete=args.no_delete)
             return EXIT_OK
         if args.timeout and elapsed > args.timeout:
             print("watch timeout reached; run `down` to stop billing", file=sys.stderr)
@@ -596,11 +808,16 @@ def cmd_run(args) -> int:
         if args.dry_run:
             return EXIT_OK
 
-        argv = ["watch", "--session", session, "--total", str(args.total or 0)]
+        argv = (["watch", "--session", session, "--total", str(args.total or 0)]
+                + (["--no-delete"] if args.no_delete else []))
         ns = build_parser().parse_args(argv)
         rc = ns.func(ns)
         if rc != EXIT_OK:
             return rc
+        # watch already reported; this is a guarded no-op so BOTH completion
+        # paths (standalone watch, full run) invoke the report exactly once.
+        finish_session_report(env_get("R2_BUCKET_NAME"), session,
+                              no_delete=args.no_delete)
     except KeyboardInterrupt:
         print("\ninterrupted - aborting")
         rc = EXIT_API
@@ -671,7 +888,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--interval", type=int, default=30)
     sp.add_argument("--timeout", type=int, default=14400)
     sp.add_argument("--total", type=int, default=0, help="override total if queue unreachable")
+    sp.add_argument("--no-delete", action="store_true",
+                    help="skip the end-of-session R2 delete prompt (report only)")
     sp.set_defaults(func=cmd_watch)
+
+    sp = sub.add_parser("retry", help="reset failed jobs back to pending")
+    sp.add_argument("--session", required=True)
+    sp.add_argument("--yes", action="store_true", help="skip confirmation prompt")
+    sp.set_defaults(func=cmd_retry)
+
+    sp = sub.add_parser("delete", help="wipe a session prefix from R2")
+    sp.add_argument("--session", required=True)
+    sp.add_argument("--force", action="store_true", help="skip confirmation prompt")
+    sp.set_defaults(func=cmd_delete)
 
     sp = sub.add_parser("down", help="delete group (stop billing)")
     sp.add_argument("--name", required=True)
@@ -690,6 +919,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--keep-group", action="store_true")
     sp.add_argument("--force-continue", action="store_true")
     sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--no-delete", action="store_true",
+                    help="skip the end-of-session R2 delete prompt (report only)")
     sp.set_defaults(func=cmd_run)
     return p
 

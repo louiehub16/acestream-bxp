@@ -41,7 +41,8 @@ HTTP ingress — verified gap). Nodes poll the Worker themselves; no gateway req
 | `docker/entrypoint.sh` | Starts API server bg → waits `/health` → runs sidecar with auto-restart; container never exits during model load |
 | `sidecar/worker_sidecar.py` | Node job loop: claim → render → upload → mark done; deadman switch |
 | `queue-worker/` | Cloudflare Worker (ES module) + D1 schema + wrangler.toml (atomic claims, stale-lease reclaim, retries≤3) |
-| `dispatcher/dispatch.py` | Local CLI: `validate / enqueue / up / watch / down / logs / run` |
+| `dispatcher/dispatch.py` | Local CLI: `validate / enqueue / up / watch / down / logs / retry / delete / run` |
+| `dispatcher/kanban_hook.py` | Optional per-tick progress POST to an external kanban board (`KANBAN_PROGRESS_URL`) |
 | `.github/workflows/docker-build.yml` | GH Actions → Docker Hub, amd64-only, GHA cache |
 
 ## One-time setup
@@ -73,6 +74,66 @@ duplicate filenames deduped). Sample: `dispatcher/prompts.sample.csv`.
 
 Individual commands: `validate` → `enqueue` → `up` → `watch` → `down`.
 
+## Operations
+
+### Retry failed jobs
+Jobs whose render failed leave a marker at `<session>/_failed/<file>.json`
+(with the error text) in R2 and are parked as `failed` (attempts exhausted) in
+the queue. Reset them without re-uploading anything:
+
+```bash
+python dispatcher/dispatch.py retry --session <S>          # table + confirm
+python dispatcher/dispatch.py retry --session <S> --yes    # no prompt
+```
+
+`retry` lists every `_failed` marker (filename + first 60 chars of the error),
+asks for confirmation, then POSTs `{session, filenames}` to the queue worker's
+`/retry` endpoint (`X-Admin-Key` auth), which flips those rows back to
+`pending` with `attempts=0`. Lists over 500 collapse to `{all: true}`.
+Running nodes pick the reset jobs up on their next claim — no restart needed.
+
+### GPU fallback pool (`GPU_CLASSES`)
+By default groups are created on the RTX 5090 class only. Set `GPU_CLASSES`
+(comma-separated Salad class UUIDs) to widen the pool:
+
+```
+GPU_CLASSES=851399fb-7329-4195-a042-d6514b28cf33,ed563892-aacd-40f5-80b7-90c9be6c759b
+```
+
+The RTX 4090 (24 GB) is usually faster to allocate and acestep-v15-xl fits its
+24 GB — Salad then schedules on whichever class frees up first.
+
+### Output format (`OUTPUT_FORMAT`)
+Set `OUTPUT_FORMAT=wav|flac|mp3` in `.env`; it is passed through to the node
+env by `up`/`run`, and the sidecar uploads that container with the matching
+R2 content type. Default: `wav`.
+
+### Completion report + R2 cleanup
+When `watch` sees the session complete it prints a completion report:
+the dashboard browse link, audio count (= number of `_done` markers), total
+size in GB (2 decimals) and a count of non-wav stragglers if any. On an
+interactive terminal it then asks `Delete these N files from R2? [y/N]` —
+answering `y` wipes the whole `<session>/` prefix via batched `delete_objects`
+(1000 keys per call) and reports the freed GB. Pass `--no-delete` to `watch`
+or `run` for report-only behavior; the prompt is skipped automatically when
+stdin isn't a TTY (e.g. cron). `run` performs the same single report after its
+watch phase succeeds (never twice).
+
+To wipe an old session later without a report:
+
+```bash
+python dispatcher/dispatch.py delete --session <S> [--force]
+```
+
+### Kanban progress hook (optional)
+Set `KANBAN_PROGRESS_URL` (e.g. your PCBGenius kanban worker
+`.../api/update`) and every `watch` tick silently POSTs a snapshot there via
+`dispatcher/kanban_hook.py`: payload mirrors that board's shape
+(`agent/status/feature/message` + generic `service/session/stats/ts`). The
+board's Cloudflare WAF rejects non-browser agents (403/1010), so a Chrome
+User-Agent header is sent. Failures never raise or print — a dead board can't
+break a watch loop.
+
 ## Reality checks (vs the original doc)
 
 | Claim in old doc | Reality |
@@ -88,7 +149,11 @@ Individual commands: `validate` → `enqueue` → `up` → `watch` → `down`.
 Shared by dispatcher `.env` and Salad group env (set automatically from `.env`):
 `QUEUE_BASE_URL, ADMIN_KEY, R2_ENDPOINT_URL, R2_ACCESS_KEY_ID,
 R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, JOB_TIMEOUT_SECONDS=900,
-MAX_RUNTIME_SECONDS=21600`. Image bakes: `ACESTEP_CONFIG_PATH=acestep-v15-xl-turbo`
+MAX_RUNTIME_SECONDS=21600, OUTPUT_FORMAT=wav`. Dispatcher-only extras:
+`GPU_CLASSES` (comma-separated Salad GPU class UUIDs; default 5090 pool,
+add `ed563892-aacd-40f5-80b7-90c9be6c759b` = RTX 4090 as fallback),
+`KANBAN_PROGRESS_URL` (optional kanban feed). Image bakes:
+`ACESTEP_CONFIG_PATH=acestep-v15-xl-turbo`
 (swap to `-xl-sft` for max quality), `ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-4B`,
 `ACESTEP_LM_BACKEND=vllm`, `HF_HOME=/hf-cache`.
 
@@ -104,3 +169,6 @@ py_compile dispatch/sidecar, node --check worker, bash -n entrypoint, YAML parse
 6. PASS — sqlite schema + UNIQUE + atomic claim
 7. PASS — enqueue parse-only
 8. PASS — sidecar idle boot + secret masking
+9. PASS — retry UPDATE simulation (sqlite: failed→pending, attempts=0, session-scoped)
+10. PASS — content-type map import via importlib (network-free)
+11. PASS — kanban hook silent-off + GPU_CLASSES/OUTPUT_FORMAT env parsing

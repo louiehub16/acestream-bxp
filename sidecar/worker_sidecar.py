@@ -42,6 +42,7 @@ JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "900"))
 MAX_RUNTIME = int(os.getenv("MAX_RUNTIME_SECONDS", "21600"))
 API_PORT = os.getenv("ACESTEP_API_PORT", "8001")
 NODE_NAME = os.getenv("NODE_NAME") or socket.gethostname()
+OUTPUT_FORMAT = os.getenv("OUTPUT_FORMAT", "wav").lower()
 
 API_BASE = f"http://127.0.0.1:{API_PORT}"
 FALLBACK_PROMPT = "Cinematic industrial background layer"
@@ -180,8 +181,8 @@ def find_audio_path(obj, depth=0):
     return None
 
 
-def render(prompt: str, lyrics: str, duration_s: int) -> bytes:
-    """Submit one generation task and return raw WAV bytes."""
+def render(prompt: str, lyrics: str, duration_s: int) -> tuple[bytes, str]:
+    """Submit one generation task; return (audio_bytes, effective_ext)."""
     payload = {
         "prompt": prompt or FALLBACK_PROMPT,
         "lyrics": lyrics or "",
@@ -239,12 +240,34 @@ def render(prompt: str, lyrics: str, duration_s: int) -> bytes:
         dl.raise_for_status()
         wav = dl.content
 
-    log(f"rendered in {time.time() - t0:.1f}s ({len(wav)} bytes)")
-    return wav
+    log(f"rendered in {time.time() - t0:.1f}s ({len(wav)} bytes raw)")
+
+    fmt = OUTPUT_FORMAT
+    out_bytes = wav
+    if fmt != "wav":
+        import subprocess
+        cmd = (["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0"]
+               + (["-f", "flac", "-c:a", "flac"] if fmt == "flac"
+                  else ["-f", "mp3", "-c:a", "libmp3lame", "-q:a", "0"])
+               + ["pipe:1"])
+        p = subprocess.run(cmd, input=wav, capture_output=True)
+        if p.returncode != 0 or not p.stdout:
+            raise RuntimeError(f"ffmpeg failed: {p.stderr[-200:]}")
+        out_bytes = p.stdout
+
+    log(f"transcode [{fmt}] {len(wav)} -> {len(out_bytes)} bytes")
+    return out_bytes, fmt
 
 
 # ---------------------------------------------------------------- job runner
 def run_job(job: dict) -> None:
+    # pre-initialised so the except-path can never NameError before /complete fires
+    job_id = "?"
+    session = "misc"
+    filename = "track.wav"
+    prompt_used = ""
+    lyrics_used = ""
+    duration = 0
     try:
         job_id = str(job.get("id", "?"))
         session = sanitize_session(job.get("session", "misc"))
@@ -255,19 +278,44 @@ def run_job(job: dict) -> None:
             report_complete(job_id, False, error="bad duration")
             return
         duration = max(10, min(600, duration))
-        r2_key = f"{session}/{filename}"
-        wav = render(job.get("prompt", ""), job.get("lyrics", ""), duration)
+        prompt_used = job.get("prompt", "") or ""
+        lyrics_used = job.get("lyrics", "") or ""
+        out_bytes, ext = render(prompt_used, lyrics_used, duration)
+        content_types = {"wav": "audio/wav", "flac": "audio/flac", "mp3": "audio/mpeg"}
+        r2_key = f"{session}/{filename[:-4]}.{ext}"
+        log(f"job {job_id}: uploading [{ext}] {len(out_bytes)} bytes -> {r2_key}")
         r2_client().put_object(Bucket=R2_BUCKET, Key=r2_key,
-                               Body=wav, ContentType="audio/wav")
+                               Body=out_bytes, ContentType=content_types[ext])
         r2_client().put_object(
             Bucket=R2_BUCKET, Key=f"{session}/_done/{filename}.json",
             Body=json.dumps({"job_id": job_id, "node": NODE_NAME,
-                             "r2_key": r2_key, "ts": time.time(),
-                             "bytes": len(wav)}),
+                             "r2_key": r2_key,
+                             "output_filename": filename,
+                             "format": ext,
+                             "bytes_out": len(out_bytes),
+                             "ts": time.time()}),
             ContentType="application/json")
+        try:
+            r2_client().delete_object(Bucket=R2_BUCKET,
+                                      Key=f"{session}/_failed/{filename}.json")
+        except Exception:  # noqa: BLE001 - stale-marker cleanup is best-effort
+            pass
         report_complete(job_id, True, r2_key=r2_key)
     except Exception as e:  # noqa: BLE001 - report and let queue retry
-        report_complete(job_id, False, error=f"{type(e).__name__}: {e}")
+        errstr = f"{type(e).__name__}: {e}"
+        try:
+            r2_client().put_object(
+                Bucket=R2_BUCKET, Key=f"{session}/_failed/{filename}.json",
+                Body=json.dumps({"job_id": job_id, "session": session,
+                                 "prompt": prompt_used, "lyrics": lyrics_used,
+                                 "duration_requested": duration,
+                                 "output_filename": filename,
+                                 "error": errstr[:500],
+                                 "node": NODE_NAME, "ts": time.time()}),
+                ContentType="application/json")
+        except Exception as fe:  # noqa: BLE001 - marker write must not mask the real error
+            log(f"job {job_id}: WARN failed-marker write failed: {fe}")
+        report_complete(job_id, False, error=errstr)
 
 
 def deadman():
@@ -280,9 +328,16 @@ def deadman():
 
 
 def main() -> int:
+    global OUTPUT_FORMAT
+    if OUTPUT_FORMAT not in ("wav", "flac", "mp3"):
+        log(f"OUTPUT_FORMAT={OUTPUT_FORMAT!r} unsupported "
+            f"(want wav|flac|mp3) - falling back to 'wav'")
+        OUTPUT_FORMAT = "wav"
+
     log(f"sidecar boot | node={NODE_NAME} queue={mask(QUEUE_BASE_URL) or '<unset>'} "
         f"bucket={mask(R2_BUCKET) or '<unset>'} r2={mask(R2_ENDPOINT) or '<unset>'} "
-        f"admin_key={mask(ADMIN_KEY)} job_timeout={JOB_TIMEOUT}s max_runtime={MAX_RUNTIME}s")
+        f"admin_key={mask(ADMIN_KEY)} job_timeout={JOB_TIMEOUT}s max_runtime={MAX_RUNTIME}s "
+        f"output_format={OUTPUT_FORMAT}")
 
     if not QUEUE_BASE_URL:
         log("QUEUE_BASE_URL unset - queue disabled, entering idle mode "

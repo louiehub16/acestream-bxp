@@ -183,6 +183,50 @@ async function handleProgress(url, env) {
   }
 }
 
+async function handleRetry(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return err("malformed JSON body", 400);
+  }
+
+  const session = typeof body?.session === "string" ? body.session.trim() : "";
+  if (!session) return err("missing or empty session", 422);
+
+  try {
+    // Bulk reset: every failed job in the session goes back to pending.
+    if (body?.all === true) {
+      const res = await env.DB.prepare(
+        `UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, attempts=0, error=NULL
+         WHERE session=?1 AND status='failed'`
+      ).bind(session).run();
+      return json({ reset: res.meta?.changes ?? 0 });
+    }
+
+    // Targeted reset: only the listed output_filenames.
+    const filenames = Array.isArray(body?.filenames) ? body.filenames : null;
+    if (!filenames || filenames.length === 0) {
+      return err('body must be {"session":S,"filenames":[...]} or {"session":S,"all":true}', 422);
+    }
+    if (filenames.length > 500) {
+      return err(`too many filenames (${filenames.length} > 500)`, 413);
+    }
+
+    let totalChanges = 0;
+    for (const fn of filenames) {
+      const res = await env.DB.prepare(
+        `UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, attempts=0, error=NULL
+         WHERE session=?1 AND status='failed' AND output_filename=?2`
+      ).bind(session, String(fn ?? "").trim()).run();
+      totalChanges += res.meta?.changes ?? 0;
+    }
+    return json({ reset: totalChanges });
+  } catch (e) {
+    return err(`retry failed: ${e.message}`, 500);
+  }
+}
+
 // ---------------------------------------------------------------- router
 export default {
   async fetch(request, env) {
@@ -206,6 +250,8 @@ export default {
           return await handleComplete(request, env);
         case path === "/progress" && request.method === "GET":
           return await handleProgress(url, env);
+        case path === "/retry" && request.method === "POST":
+          return await handleRetry(request, env);
         default:
           return err(`no route: ${request.method} ${path}`, 404);
       }
