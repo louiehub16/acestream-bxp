@@ -567,6 +567,8 @@ def cmd_logs(args) -> int:
 
 
 def cmd_run(args) -> int:
+    global LAST_CREATED_GROUP
+    LAST_CREATED_GROUP = None  # reset so a stale group from a prior in-process run can never be torn down by mistake
     t0 = time.time()
     session = datetime.now(timezone.utc).strftime("generation_%Y-%m-%d_%H-%M-%S")
     group_name = None
