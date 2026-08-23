@@ -250,12 +250,14 @@ def render(prompt: str, lyrics: str, duration_s: int) -> tuple[bytes, str]:
                + (["-f", "flac", "-c:a", "flac"] if fmt == "flac"
                   else ["-f", "mp3", "-c:a", "libmp3lame", "-q:a", "0"])
                + ["pipe:1"])
-        p = subprocess.run(cmd, input=wav, capture_output=True)
+        try:
+            p = subprocess.run(cmd, input=wav, capture_output=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg timeout after 300s")
         if p.returncode != 0 or not p.stdout:
-            raise RuntimeError(f"ffmpeg failed: {p.stderr[-200:]}")
+            raise RuntimeError(f"ffmpeg failed: {p.stderr.decode(errors='replace')[-200:]}")
         out_bytes = p.stdout
-
-    log(f"transcode [{fmt}] {len(wav)} -> {len(out_bytes)} bytes")
+        log(f"transcode [{fmt}] {len(wav)} -> {len(out_bytes)} bytes")
     return out_bytes, fmt
 
 
@@ -275,8 +277,9 @@ def run_job(job: dict) -> None:
         try:
             duration = int(job.get("duration") or 240)
         except ValueError:
-            report_complete(job_id, False, error="bad duration")
-            return
+            # job_id is already bound above; raise so run_job's except writes
+            # the _failed marker and reports /complete instead of a bare return
+            raise ValueError("bad duration")
         duration = max(10, min(600, duration))
         prompt_used = job.get("prompt", "") or ""
         lyrics_used = job.get("lyrics", "") or ""
@@ -307,7 +310,7 @@ def run_job(job: dict) -> None:
             r2_client().put_object(
                 Bucket=R2_BUCKET, Key=f"{session}/_failed/{filename}.json",
                 Body=json.dumps({"job_id": job_id, "session": session,
-                                 "prompt": prompt_used, "lyrics": lyrics_used,
+                                 "prompt": prompt_used[:2000], "lyrics": lyrics_used[:2000],
                                  "duration_requested": duration,
                                  "output_filename": filename,
                                  "error": errstr[:500],

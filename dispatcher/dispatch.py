@@ -72,7 +72,13 @@ ENV = load_env()
 
 
 def env_get(key: str, default: str = "") -> str:
-    return os.environ.get(key) or ENV.get(key) or default
+    # os.environ wins whenever the variable is PRESENT, even if set to "" -
+    # e.g. GPU_CLASSES="" in the real env explicitly overrides a .env value.
+    # The .env file is only consulted for keys absent from os.environ.
+    val = os.environ.get(key)
+    if val is not None:
+        return val
+    return ENV.get(key, default)
 
 
 def gpu_classes() -> list[str]:
@@ -275,31 +281,48 @@ except ImportError:  # pragma: no cover - depends on how dispatch.py is loaded
 
 
 # ---------------------------------------------------------------- completion report / delete
-def r2_delete_prefix(bucket: str, session: str) -> tuple[int, int]:
+def r2_delete_prefix(bucket: str, session: str) -> tuple[int, int] | bool:
     """Delete every object under <session>/ (chunks of 1000).
 
-    Returns (deleted_count, freed_bytes).
+    Returns (deleted_count, freed_bytes), or False when the R2 API reported
+    per-object Errors for this prefix (a warning with the error count is
+    printed here; callers should map False to EXIT_API).
     """
     c = r2_client()
     paginator = c.get_paginator("list_objects_v2")
     deleted, freed, batch = 0, 0, []
+    sizes: dict[str, int] = {}  # {key: size} built at list time
 
-    def flush() -> None:
-        nonlocal deleted
+    def flush() -> int:
+        nonlocal deleted, freed
         if not batch:
-            return
+            return 0
         resp = c.delete_objects(Bucket=bucket,
                                 Delete={"Quiet": True, "Objects": batch})
-        deleted += len(batch) - len(resp.get("Errors", []))
+        errors = resp.get("Errors", [])
+        err_keys = {e.get("Key") for e in errors}
+        for o in batch:
+            if o["Key"] in err_keys:
+                freed -= sizes.get(o["Key"], 0)
+            else:
+                deleted += 1
         batch.clear()
+        return len(errors)
 
+    n_errors = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=f"{session}/"):
         for obj in page.get("Contents", []):
+            size = obj.get("Size", obj.get("ContentLength", 0)) or 0
+            sizes[obj["Key"]] = size
+            freed += size
             batch.append({"Key": obj["Key"]})
-            freed += obj.get("Size", obj.get("ContentLength", 0)) or 0
             if len(batch) >= 1000:
-                flush()
-    flush()
+                n_errors += flush()
+    n_errors += flush()
+    if n_errors:
+        print(f"WARNING: R2 delete: {n_errors} object(s) under '{session}/' "
+              f"failed to delete - prefix NOT fully wiped", file=sys.stderr)
+        return False
     return deleted, freed
 
 
@@ -310,8 +333,8 @@ def finish_session_report(bucket: str, session: str,
                           no_delete: bool = False) -> None:
     """End-of-session R2 stats + interactive offer to wipe the prefix.
 
-    Prints the dashboard browse link, audio count (= _done markers), total GB
-    and any non-wav stragglers; then prompts before deleting the whole
+    Prints the dashboard browse link, audio count (= _done markers), total GiB
+    and any non-audio stragglers; then prompts before deleting the whole
     <session>/ prefix. Skipped entirely if already reported this process
     (`run` -> `watch` would otherwise double-report), when --no-delete is set,
     or when stdin is not a TTY.
@@ -322,22 +345,28 @@ def finish_session_report(bucket: str, session: str,
     _REPORTED_SESSIONS.add(key)
 
     c = r2_client()
-    total_bytes, n_files, non_wav = 0, 0, 0
+    expected_ext = env_get("OUTPUT_FORMAT", "wav").lower()
+    if expected_ext and not expected_ext.startswith("."):
+        expected_ext = "." + expected_ext
+    audio_exts = tuple({".wav", ".flac", ".mp3", expected_ext})
+    total_bytes, n_files, non_audio = 0, 0, 0
     paginator = c.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=f"{session}/"):
         for obj in page.get("Contents", []):
             total_bytes += obj.get("Size", obj.get("ContentLength", 0)) or 0
             n_files += 1
-            if not obj["Key"].endswith(".wav") and "/_done/" not in obj["Key"]:
-                non_wav += 1
+            key = obj["Key"]
+            if (not key.lower().endswith(audio_exts)
+                    and "/_done/" not in key):
+                non_audio += 1
     done, _ = count_done_markers(bucket, session)
 
     print(browse_link(session))
     print(f"audio files : {done}")
-    print(f"total size  : {total_bytes / 1024 ** 3:.2f} GB "
+    print(f"total size  : {total_bytes / 1024 ** 3:.2f} GiB "
           f"across {n_files} object(s)")
-    if non_wav:
-        print(f"non-wav     : {non_wav} object(s) - inspect if unexpected")
+    if non_audio:
+        print(f"non-audio   : {non_audio} object(s) - inspect if unexpected")
     if not n_files or no_delete or not sys.stdin.isatty():
         return
     try:
@@ -347,12 +376,32 @@ def finish_session_report(bucket: str, session: str,
     if ans.strip().lower() != "y":
         print("kept R2 objects")
         return
-    deleted, freed = r2_delete_prefix(bucket, session)
-    print(f"freed {freed / 1024 ** 3:.2f} GB ({deleted} object(s) deleted)")
+    res = r2_delete_prefix(bucket, session)
+    if res is False:
+        print("WARNING: R2 prefix not fully wiped - see warning above",
+              file=sys.stderr)
+        return
+    deleted, freed = res
+    print(f"freed {freed / 1024 ** 3:.2f} GiB ({deleted} object(s) deleted)")
+
+
+def _session_arg_error(session: str) -> str:
+    """Validation message for a --session value, or '' if acceptable."""
+    s = (session or "").strip()
+    if not s:
+        return "--session must not be blank"
+    if "." in session:
+        return (f"invalid --session '{session}': '.' not allowed "
+                f"(sessions are plain R2 prefix names)")
+    return ""
 
 
 def cmd_delete(args) -> int:
     """Standalone `delete --session S`: wipe <S>/ from R2, no report."""
+    err = _session_arg_error(args.session)
+    if err:
+        print(err, file=sys.stderr)
+        return EXIT_CONFIG
     bucket = env_get("R2_BUCKET_NAME")
     if not bucket:
         print("R2_BUCKET_NAME not set in .env", file=sys.stderr)
@@ -371,11 +420,14 @@ def cmd_delete(args) -> int:
             print("aborted")
             return EXIT_OK
     try:
-        deleted, freed = r2_delete_prefix(bucket, args.session)
+        res = r2_delete_prefix(bucket, args.session)
     except Exception as e:  # noqa: BLE001
         print(f"delete failed: {e}", file=sys.stderr)
         return EXIT_API
-    print(f"deleted {deleted} object(s); freed {freed / 1024 ** 3:.2f} GB")
+    if res is False:
+        return EXIT_API  # per-object R2 errors; warning already printed
+    deleted, freed = res
+    print(f"deleted {deleted} object(s); freed {freed / 1024 ** 3:.2f} GiB")
     return EXIT_OK
 
 
@@ -399,23 +451,42 @@ def list_failed_markers(bucket: str, session: str) -> list[tuple[str, str]]:
 
 
 def queue_retry(session: str, filenames: list[str]) -> dict:
+    """Reset failed jobs to pending via the queue /retry endpoint.
+
+    Always sends an explicit {"session", "filenames"} body (never {"all": true}
+    - a stale/typo'd session must never mass-reset another session's jobs),
+    chunked at 400 filenames per POST. Sums `reset`/`updated` across responses.
+    """
     headers = {"X-Admin-Key": env_get("ADMIN_KEY"),
                "Content-Type": "application/json"}
-    if len(filenames) > 500:
-        body: dict = {"session": session, "all": True}
-    else:
-        body = {"session": session, "filenames": filenames}
-    r = retry_call(lambda: requests.post(f"{queue_base()}/retry", headers=headers,
-                                         data=json.dumps(body), timeout=120),
-                   what="queue-retry")
-    r.raise_for_status()
-    try:
-        return r.json()
-    except ValueError:
-        return {}
+    out: dict = {}
+    for i in range(0, len(filenames), 400):
+        chunk = filenames[i:i + 400]
+
+        def do_post(c=chunk):
+            r = requests.post(f"{queue_base()}/retry", headers=headers,
+                              data=json.dumps({"session": session,
+                                               "filenames": c}),
+                              timeout=120)
+            r.raise_for_status()
+            return r
+
+        r = retry_call(do_post, what=f"queue-retry[{i}]")
+        try:
+            res = r.json()
+        except ValueError:
+            res = {}
+        for k in ("reset", "updated"):
+            if k in res:
+                out[k] = out.get(k, 0) + res[k]
+    return out
 
 
 def cmd_retry(args) -> int:
+    err = _session_arg_error(args.session)
+    if err:
+        print(err, file=sys.stderr)
+        return EXIT_CONFIG
     bucket = env_get("R2_BUCKET_NAME")
     session = args.session
     try:
@@ -714,9 +785,12 @@ def cmd_watch(args) -> int:
         if recent:
             print(f"  latest: {', '.join(recent)}")
         if env_get("KANBAN_PROGRESS_URL"):
-            post_progress(session, {"done": done, "failed": failed,
-                                    "pending": pending, "claimed": claimed,
-                                    "total": total})
+            try:
+                post_progress(session, {"done": done, "failed": failed,
+                                        "pending": pending, "claimed": claimed,
+                                        "total": total})
+            except Exception:  # noqa: BLE001 - kanban hook must never kill watch
+                pass
         if total and done + failed >= total:
             print("=" * 62)
             print(f"SESSION COMPLETE: ok={done} failed={failed}")

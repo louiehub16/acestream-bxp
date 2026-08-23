@@ -191,34 +191,42 @@ async function handleRetry(request, env) {
     return err("malformed JSON body", 400);
   }
 
-  const session = typeof body?.session === "string" ? body.session.trim() : "";
-  if (!session) return err("missing or empty session", 422);
+  const session = typeof body?.session === "string" ? body.session.trim().slice(0, 200) : "";
+  const all = body?.all === true;
+  if (!all && !session) return err("session required unless all:true", 422);
 
   try {
-    // Bulk reset: every failed job in the session goes back to pending.
-    if (body?.all === true) {
+    // Bulk reset: every failed job goes back to pending (single statement,
+    // NO session predicate).
+    if (all) {
       const res = await env.DB.prepare(
         `UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, attempts=0, error=NULL
-         WHERE session=?1 AND status='failed'`
-      ).bind(session).run();
-      return json({ reset: res.meta?.changes ?? 0 });
+         WHERE status='failed'
+         RETURNING id`
+      ).all();
+      return json({ reset: res.results.length });
     }
 
-    // Targeted reset: only the listed output_filenames.
+    // Targeted reset: only the listed output_filenames within the session.
     const filenames = Array.isArray(body?.filenames) ? body.filenames : null;
     if (!filenames || filenames.length === 0) {
       return err('body must be {"session":S,"filenames":[...]} or {"session":S,"all":true}', 422);
     }
+    for (const fn of filenames) {
+      if (typeof fn !== "string" || !fn.trim()) return err("bad filename", 422);
+    }
     if (filenames.length > 500) {
       return err(`too many filenames (${filenames.length} > 500)`, 413);
     }
+    const list = [...new Set(filenames.map((fn) => fn.slice(0, 255)))];
 
+    const stmt = env.DB.prepare(
+      `UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, attempts=0, error=NULL
+       WHERE status='failed' AND output_filename=?2 AND session=?1`
+    );
     let totalChanges = 0;
-    for (const fn of filenames) {
-      const res = await env.DB.prepare(
-        `UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, attempts=0, error=NULL
-         WHERE session=?1 AND status='failed' AND output_filename=?2`
-      ).bind(session, String(fn ?? "").trim()).run();
+    for (const fn of list) {
+      const res = await stmt.bind(session, fn).run();
       totalChanges += res.meta?.changes ?? 0;
     }
     return json({ reset: totalChanges });
