@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# ACE-Stream 5090 BXP — build & push image to Docker Hub (amd64 ONLY; Salad
+# nodes are x86_64).
+#
+# USAGE
+#   * Push a tag like v1.0.0            -> builds & pushes :v1.0.0 :<sha> :latest
+#   * Run manually (Actions tab)        -> optional image_tag / bake_weights input
+#   * bake_weights=true bakes HF weights into layers (~25 GB) — may exceed the
+#     14 GB free disk of a runner even after the cleanup step. Default false;
+#     Salad nodes pull weights from HF at first boot instead (recommended).
+#
+# REQUIRED REPO SECRETS: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (Docker Hub ->
+# Account Settings -> Security -> New Access Token, Read/Write).
+# ---------------------------------------------------------------------------
+name: docker-build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      bake_weights:
+        description: "Bake model weights into image (~25 GB extra; risky on runner disk)"
+        type: boolean
+        default: false
+      image_tag:
+        description: 'Extra tag (optional, e.g. "test")'
+        required: false
+        default: ""
+
+env:
+  IMAGE_NAME: acestep-bxp
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space (runners ship nearly full)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compose tags
+        id: tags
+        run: |
+          TAGS="docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME}:latest"
+          TAGS="${TAGS},docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME}:${GITHUB_SHA::7}"
+          EXTRA="${{ inputs.image_tag }}"
+          if [ -n "$EXTRA" ]; then
+            TAGS="${TAGS},docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME}:${EXTRA}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false # avoid attestation manifests some registries/pullers choke on
+          build-args: |
+            BAKE_WEIGHTS=${{ inputs.bake_weights || 'false' }}
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

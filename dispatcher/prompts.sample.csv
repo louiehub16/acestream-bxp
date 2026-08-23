@@ -1,0 +1,14 @@
+prompt,duration,output_filename,lyrics
+"A professional atmospheric deep house track with 124bpm thumping kick drums and warm analog pads",240,deephouse_track1.wav,
+"Chill ambient lo-fi piano progression overlaying soft rain sounds for deep focus",180,lofi_piano_track2.wav,
+"Epic cinematic trailer soundscape with heavy industrial brass stabs and thundering percussion",300,epic_trailer_track3.wav,
+"Retro synthwave neon night drive with gated reverb drums and soaring analog lead",120,synthwave_track4.wav,
+"Smoky late-night jazz trio with brushed drums upright bass and warm piano",200,jazz_trio_track5.wav,"[verse]
+Under the smoke and amber light
+the bass walks slow through the night
+[chorus]
+One more tune before the dawn
+then the melody is gone"
+"Deep ambient drone for meditation with evolving textures and distant chimes",480,ambient_drone_track6.wav,
+"High-energy drum and bass roller at 174bpm with rolling breaks and sub-bass wobble",90,dnb_track7.wav,
+"Heroic orchestral strings and brass building to a triumphant finale",300,orchestral_track8.wav,

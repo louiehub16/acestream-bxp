@@ -1,0 +1,19 @@
+# ACE-Stream 5090 BXP — queue Worker config
+#
+# DEPLOY SEQUENCE (run when ready; requires cloudflare login):
+#   cd queue-worker
+#   npx wrangler d1 create acestream-queue          # copy the returned database_id below
+#   npx wrangler d1 execute acestream-queue --remote --file=schema.sql
+#   npx wrangler secret put ADMIN_KEY               # invent a long random string
+#   npx wrangler deploy
+#   # -> note the https://acestream-queue.<your-subdomain>.workers.dev URL
+#   # -> put it in dispatcher .env as QUEUE_BASE_URL
+#
+name = "acestream-queue"
+main = "src/index.js"
+compatibility_date = "2025-03-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "acestream-queue"
+database_id = "PLACEHOLDER_run_wrangler_d1_create_acestream-queue"
