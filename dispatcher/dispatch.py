@@ -47,6 +47,7 @@ GPU_5090 = "851399fb-7329-4195-a042-d6514b28cf33"  # RTX 5090 (32 GB) in org luc
 ACCOUNT_ID = "abd12cd58366e2d99a202218328b1340"
 FALLBACK_PROMPT = "Cinematic industrial background layer"
 DURATION_MIN, DURATION_MAX = 10, 600
+LAST_CREATED_GROUP = None  # last successfully created Salad group (teardown fallback)
 
 
 # ---------------------------------------------------------------- .env
@@ -421,6 +422,7 @@ def build_node_env() -> dict:
 
 
 def cmd_up(args) -> int:
+    global LAST_CREATED_GROUP
     if args.image:
         image = args.image
     else:
@@ -443,6 +445,7 @@ def cmd_up(args) -> int:
 
     name = created["name"]
     args.created_group = name
+    LAST_CREATED_GROUP = name
     try:
         salad_start_group(created["name"])
     except Exception as e:  # noqa: BLE001
@@ -600,12 +603,14 @@ def cmd_run(args) -> int:
         print("\ninterrupted - aborting")
         rc = EXIT_API
     finally:
-        if group_name and not args.keep_group:
-            gname = group_name
+        gname = group_name or LAST_CREATED_GROUP
+        billing_ok = True
+        if gname and not args.keep_group:
             print(f"teardown: deleting {gname}")
             try:
                 salad_delete_group(gname)
             except Exception as e:  # noqa: BLE001
+                billing_ok = False
                 print(f"WARN teardown failed: {e} - DELETE IT MANUALLY", file=sys.stderr)
             else:
                 for _ in range(24):
@@ -619,17 +624,21 @@ def cmd_run(args) -> int:
                         break
                     time.sleep(5)
                 else:
+                    billing_ok = False
                     print("WARNING: group may still exist - billing could continue",
                           file=sys.stderr)
     if rc != EXIT_OK:
         return rc
+    if not billing_ok:
+        print("WARNING: exiting nonzero - verify group deletion in Salad dashboard")
+        rc = EXIT_API
     hours = (time.time() - t0) / 3600
     est = args.replicas * hours * 0.35
     print("=" * 62)
     print(f"GRAND SUMMARY | wall={(time.time()-t0)/60:.1f}m | est cost ~${est:.2f}"
           f" ({args.replicas} replicas x $0.35/hr)")
     print(browse_link(session))
-    return EXIT_OK
+    return rc
 
 
 # ---------------------------------------------------------------- parser
