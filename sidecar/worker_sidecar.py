@@ -73,6 +73,7 @@ def make_session() -> requests.Session:
 
 
 SESSION = make_session()
+CLAIM_SESSION = requests.Session()
 
 
 def queue_headers():
@@ -81,7 +82,7 @@ def queue_headers():
 
 def claim_job():
     """Ask the queue for one job. Returns dict or None."""
-    r = SESSION.get(f"{QUEUE_BASE_URL}/claim",
+    r = CLAIM_SESSION.get(f"{QUEUE_BASE_URL}/claim",
                     params={"worker_id": NODE_NAME},
                     headers=queue_headers(), timeout=30)
     r.raise_for_status()
@@ -253,6 +254,7 @@ def run_job(job: dict) -> None:
         except ValueError:
             report_complete(job_id, False, error="bad duration")
             return
+        duration = max(10, min(600, duration))
         r2_key = f"{session}/{filename}"
         wav = render(job.get("prompt", ""), job.get("lyrics", ""), duration)
         r2_client().put_object(Bucket=R2_BUCKET, Key=r2_key,
@@ -272,7 +274,7 @@ def deadman():
     time.sleep(max(60, MAX_RUNTIME - 120))
     STOP_EVENT.set()
     log("STOP_EVENT set - draining")
-    time.sleep(180)
+    time.sleep(max(180, JOB_TIMEOUT + 60))
     log("DEADMAN hard exit")
     os._exit(3)
 
@@ -285,7 +287,6 @@ def main() -> int:
     if not QUEUE_BASE_URL:
         log("QUEUE_BASE_URL unset - queue disabled, entering idle mode "
             "(container stays up for debugging)")
-        threading.Thread(target=deadman, daemon=True).start()
         while True:
             time.sleep(3600)
 
@@ -313,7 +314,11 @@ def main() -> int:
             time.sleep(15)
             continue
 
-        if not job:
+        if job is not None and not isinstance(job, dict):
+            log("malformed job payload, skipping")
+            time.sleep(15)
+            continue
+        elif job is None:
             time.sleep(15)
             continue
 

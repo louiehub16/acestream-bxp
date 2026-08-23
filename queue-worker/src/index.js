@@ -156,16 +156,10 @@ async function handleComplete(request, env) {
       return json({ requeued: false });
     }
 
-    // failure path: retry up to 3 attempts, else mark failed (single conditional UPDATE)
-    await env.DB.prepare(
-      `UPDATE jobs SET status=CASE WHEN attempts<3 THEN 'pending' ELSE 'failed' END,
-         claimed_by=NULL, claimed_at=NULL, error=?2
-       WHERE id_text=?1 AND status='claimed'`
-    ).bind(jobId, String(body.error || "unknown").slice(0, 500)).run();
-    const row = await env.DB.prepare(
-      `SELECT status FROM jobs WHERE id_text=?1`
-    ).bind(jobId).first();
-    return json({ requeued: row?.status === "pending" });
+    // failure path: retry up to 3 attempts, else mark failed (single conditional UPDATE + RETURNING)
+    const res = await env.DB.prepare(`UPDATE jobs SET status=(CASE WHEN attempts<3 THEN 'pending' ELSE 'failed' END), claimed_by=NULL, claimed_at=NULL, error=?2 WHERE id_text=?1 AND status='claimed' RETURNING status`).bind(jobId, String(body.error||"unknown").slice(0,500)).all();
+    if (!res.results || res.results.length===0) return err("no active claim",409);
+    return json({requeued: res.results[0].status==="pending"});
   } catch (e) {
     return err(`complete failed: ${e.message}`, 500);
   }

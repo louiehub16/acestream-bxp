@@ -136,13 +136,6 @@ def salad_create_group(name: str, image: str, replicas: int, node_env: dict,
             r.raise_for_status()
             return r
         retry_call(do_create2, what="salad-create-retry")
-
-    # autostart_policy defaults false -> explicit start with NO body (body => 400)
-    start_url = f"{url}/{body['name']}/start"
-    retry_call(lambda: requests.post(
-                   start_url, headers=salad_headers(),
-                   timeout=60).raise_for_status(),
-               what="salad-start")
     return body
 
 
@@ -166,6 +159,12 @@ def salad_delete_group(name: str) -> bool:
         return False
     r.raise_for_status()
     return True
+
+
+def salad_start_group(name):
+    retry_call(lambda: requests.post(
+        f"{SALAD_BASE}/organizations/{SALAD_ORG}/projects/{SALAD_PROJECT}/containers/{name}/start",
+        headers=salad_headers(), timeout=60).raise_for_status(), what="salad-start")
 
 
 def salad_logs(name: str):
@@ -422,7 +421,7 @@ def build_node_env() -> dict:
 
 
 def cmd_up(args) -> int:
-    if "/" in args.image:
+    if args.image:
         image = args.image
     else:
         user = env_get("DOCKERHUB_USER")
@@ -444,6 +443,11 @@ def cmd_up(args) -> int:
 
     name = created["name"]
     args.created_group = name
+    try:
+        salad_start_group(created["name"])
+    except Exception as e:  # noqa: BLE001
+        print(f"start failed: {e}", file=sys.stderr)
+        return EXIT_API
     print(f"group '{name}' created+start sent; waiting for running state...")
     deadline = time.time() + 15 * 60
     last = ""
@@ -556,21 +560,24 @@ def cmd_logs(args) -> int:
         ts = e.get("log_entry_start", e.get("logged_at", ""))
         msg = e.get("entry", e.get("message", ""))
         print(f"{ts} | {msg}")
+    return EXIT_OK
 
 
 def cmd_run(args) -> int:
     t0 = time.time()
     session = datetime.now(timezone.utc).strftime("generation_%Y-%m-%d_%H-%M-%S")
     group_name = None
+    rc = EXIT_OK
     rc_validate = cmd_validate(argparse.Namespace())
     if rc_validate != EXIT_OK and not args.force_continue:
         return rc_validate
     try:
-        argv = ["enqueue", "--csv", args.csv, "--session", session]
-        ns = build_parser().parse_args(argv)
-        rc = ns.func(ns)
-        if rc != EXIT_OK:
-            return rc
+        if not args.dry_run:
+            argv = ["enqueue", "--csv", args.csv, "--session", session]
+            ns = build_parser().parse_args(argv)
+            rc = ns.func(ns)
+            if rc != EXIT_OK:
+                return rc
 
         argv = ["up", "--replicas", str(args.replicas)] + (
             ["--dry-run"] if args.dry_run else [])
@@ -590,17 +597,27 @@ def cmd_run(args) -> int:
         if rc != EXIT_OK:
             return rc
     except KeyboardInterrupt:
-        print("\ninterrupted")
+        print("\ninterrupted - aborting")
+        rc = EXIT_API
     finally:
         if group_name and not args.keep_group:
-            print(f"teardown: deleting {group_name}")
+            gname = group_name
+            print(f"teardown: deleting {gname}")
             try:
-                salad_delete_group(group_name)
-                time.sleep(5)
-                if salad_get_group(group_name) is None:
-                    print("billing stopped.")
+                salad_delete_group(gname)
             except Exception as e:  # noqa: BLE001
                 print(f"WARN teardown failed: {e} - DELETE IT MANUALLY", file=sys.stderr)
+            else:
+                for _ in range(24):
+                    if salad_get_group(gname) is None:
+                        print("billing stopped.")
+                        break
+                    time.sleep(5)
+                else:
+                    print("WARNING: group may still exist - billing could continue",
+                          file=sys.stderr)
+    if rc != EXIT_OK:
+        return rc
     hours = (time.time() - t0) / 3600
     est = args.replicas * hours * 0.35
     print("=" * 62)
