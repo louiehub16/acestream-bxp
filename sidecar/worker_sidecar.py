@@ -47,6 +47,7 @@ API_BASE = f"http://127.0.0.1:{API_PORT}"
 FALLBACK_PROMPT = "Cinematic industrial background layer"
 
 log_lock = threading.Lock()
+STOP_EVENT = threading.Event()
 
 
 def log(msg: str) -> None:
@@ -64,7 +65,7 @@ def make_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(total=5, backoff_factor=2,
                   status_forcelist=[500, 502, 503, 504],
-                  allowed_methods=["GET", "POST"])
+                  allowed_methods=["GET"])
     adapter = HTTPAdapter(max_retries=retry)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
@@ -93,12 +94,18 @@ def report_complete(job_id: str, ok: bool, *, r2_key=None, error=None):
         body["r2_key"] = r2_key
     else:
         body["error"] = (error or "unknown")[:500]
-    try:
-        SESSION.post(f"{QUEUE_BASE_URL}/complete",
-                     headers=queue_headers(), data=json.dumps(body), timeout=30)
-        log(f"job {job_id}: reported ok={ok}")
-    except Exception as e:  # noqa: BLE001 - never let reporting kill the loop
-        log(f"job {job_id}: WARNING complete-report failed: {e}")
+    last = None
+    for attempt in range(5):
+        try:
+            r = SESSION.post(f"{QUEUE_BASE_URL}/complete",
+                             headers=queue_headers(), data=json.dumps(body), timeout=30)
+            r.raise_for_status()
+            log(f"job {job_id}: reported ok={ok} (attempt {attempt + 1})")
+            return
+        except Exception as e:  # noqa: BLE001 - retry, never let reporting kill the loop
+            last = e
+            time.sleep(10)
+    log(f"job {job_id}: ERROR complete-report failed after 5 tries: {last}")
 
 
 # ---------------------------------------------------------------- r2
@@ -120,6 +127,11 @@ def sanitize_filename(name: str) -> str:
     base = os.path.basename((name or "").strip().replace("\\", "/"))
     safe = "".join(c for c in base if c.isalnum() or c in "._-") or "track.wav"
     return safe if safe.lower().endswith(".wav") else safe + ".wav"
+
+
+def sanitize_session(s):
+    base = (s or "").strip().replace("\\", "/").split("/")[-1]
+    return "".join(c for c in base if c.isalnum() or c in "._-") or "misc"
 
 
 # ---------------------------------------------------------------- acestep api
@@ -215,7 +227,9 @@ def render(prompt: str, lyrics: str, duration_s: int) -> bytes:
 
     # fetch bytes: server route first, direct URL fallback
     if audio_ref.startswith("http"):
-        wav = SESSION.get(audio_ref, timeout=600).content
+        r = SESSION.get(audio_ref, timeout=600)
+        r.raise_for_status()
+        wav = r.content
     else:
         dl = SESSION.get(f"{API_BASE}/v1/audio", params={"path": audio_ref}, timeout=600)
         if dl.status_code == 404 and audio_ref.startswith("/"):
@@ -230,13 +244,16 @@ def render(prompt: str, lyrics: str, duration_s: int) -> bytes:
 
 # ---------------------------------------------------------------- job runner
 def run_job(job: dict) -> None:
-    job_id = str(job.get("id", "?"))
-    session = job.get("session", "misc")
-    filename = sanitize_filename(job.get("output_filename", ""))
-    duration = int(job.get("duration") or 240)
-    r2_key = f"{session}/{filename}"
-
     try:
+        job_id = str(job.get("id", "?"))
+        session = sanitize_session(job.get("session", "misc"))
+        filename = sanitize_filename(job.get("output_filename", ""))
+        try:
+            duration = int(job.get("duration") or 240)
+        except ValueError:
+            report_complete(job_id, False, error="bad duration")
+            return
+        r2_key = f"{session}/{filename}"
         wav = render(job.get("prompt", ""), job.get("lyrics", ""), duration)
         r2_client().put_object(Bucket=R2_BUCKET, Key=r2_key,
                                Body=wav, ContentType="audio/wav")
@@ -252,8 +269,11 @@ def run_job(job: dict) -> None:
 
 
 def deadman():
-    time.sleep(MAX_RUNTIME)
-    log(f"DEADMAN SWITCH: MAX_RUNTIME_SECONDS={MAX_RUNTIME} reached - hard exit")
+    time.sleep(max(60, MAX_RUNTIME - 120))
+    STOP_EVENT.set()
+    log("STOP_EVENT set - draining")
+    time.sleep(180)
+    log("DEADMAN hard exit")
     os._exit(3)
 
 
@@ -273,10 +293,19 @@ def main() -> int:
         log("FATAL: R2 env incomplete - cannot upload results")
         return 2
 
+    ok = wait_for_server(time.time() + 3600)
+    if not ok:
+        log("FATAL: ACE-Step server never became healthy")
+        return 2
+    log("server ready - starting poll loop")
+
     threading.Thread(target=deadman, daemon=True).start()
     log(f"polling loop start (deadman armed at +{MAX_RUNTIME}s)")
 
     while True:
+        if STOP_EVENT.is_set():
+            log("shutdown: stop claiming")
+            break
         try:
             job = claim_job()
         except Exception as e:  # noqa: BLE001 - transient queue errors

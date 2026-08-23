@@ -53,6 +53,7 @@ function normalizeJob(raw) {
     : null;
   if (!filename) return [null, "missing output_filename"];
   const idText = raw.id !== undefined && raw.id !== null ? String(raw.id).slice(0, 64) : null;
+  if (!idText) return [null, "missing id"];
   return [{
     id_text: idText,
     session,
@@ -98,11 +99,16 @@ async function handleJobs(request, env) {
 }
 
 async function handleClaim(url, env) {
-  const workerId = url.searchParams.get("worker_id") || "unknown-node";
+  const workerId = (url.searchParams.get("worker_id") || "unknown-node").slice(0, 128);
   const t = now();
 
   // 1) reclaim stale leases (>30 min claimed = node died), max 3 attempts
   try {
+    await env.DB.prepare(
+      `UPDATE jobs SET status='failed', error='lease expired on final attempt'
+       WHERE status='claimed' AND attempts >= 3 AND claimed_at IS NOT NULL
+         AND claimed_at < ?1`
+    ).bind(t - 1800).run();
     await env.DB.prepare(
       `UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL
        WHERE status='claimed' AND attempts < 3 AND claimed_at IS NOT NULL
@@ -141,28 +147,25 @@ async function handleComplete(request, env) {
 
   try {
     if (body.ok === true) {
-      await env.DB.prepare(
-        `UPDATE jobs SET status='done', r2_key=?2, error=NULL WHERE id_text=?1 AND status='claimed'`
+      const res = await env.DB.prepare(
+        `UPDATE jobs SET status='done', r2_key=?2 WHERE id_text=?1 AND status='claimed'`
       ).bind(jobId, body.r2_key || null).run();
+      if ((res.meta?.changes ?? 0) === 0) {
+        return json({ error: "no active claim" }, 409);
+      }
       return json({ requeued: false });
     }
 
-    // failure path: retry up to 3 attempts, else mark failed
-    const row = await env.DB.prepare(
-      `SELECT attempts FROM jobs WHERE id_text=?1`
-    ).bind(jobId).first();
-    if (!row) return json({ requeued: false });
-    if (row.attempts < 3) {
-      await env.DB.prepare(
-        `UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, error=?2
-         WHERE id_text=?1`
-      ).bind(jobId, String(body.error || "unknown").slice(0, 500)).run();
-      return json({ requeued: true });
-    }
+    // failure path: retry up to 3 attempts, else mark failed (single conditional UPDATE)
     await env.DB.prepare(
-      `UPDATE jobs SET status='failed', error=?2 WHERE id_text=?1`
+      `UPDATE jobs SET status=CASE WHEN attempts<3 THEN 'pending' ELSE 'failed' END,
+         claimed_by=NULL, claimed_at=NULL, error=?2
+       WHERE id_text=?1 AND status='claimed'`
     ).bind(jobId, String(body.error || "unknown").slice(0, 500)).run();
-    return json({ requeued: false });
+    const row = await env.DB.prepare(
+      `SELECT status FROM jobs WHERE id_text=?1`
+    ).bind(jobId).first();
+    return json({ requeued: row?.status === "pending" });
   } catch (e) {
     return err(`complete failed: ${e.message}`, 500);
   }
@@ -193,7 +196,7 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
     try {
-      if (path === "/health") {
+      if (path === "/health" && request.method === "GET") {
         return json({ ok: true, service: "acestream-queue" });
       }
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 import re
@@ -138,7 +139,9 @@ def salad_create_group(name: str, image: str, replicas: int, node_env: dict,
 
     # autostart_policy defaults false -> explicit start with NO body (body => 400)
     start_url = f"{url}/{body['name']}/start"
-    retry_call(lambda: requests.post(start_url, headers=salad_headers(), timeout=60),
+    retry_call(lambda: requests.post(
+                   start_url, headers=salad_headers(),
+                   timeout=60).raise_for_status(),
                what="salad-start")
     return body
 
@@ -256,7 +259,7 @@ def parse_csv(path: Path) -> list[dict]:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
     except csv.Error:
         dialect = csv.excel  # fallback comma
-    reader = csv.DictReader(text.splitlines(), dialect=dialect)
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
     if not reader.fieldnames:
         raise SystemExit(f"{path}: empty CSV")
     fields = [f.strip().lower() for f in reader.fieldnames]
@@ -268,6 +271,9 @@ def parse_csv(path: Path) -> list[dict]:
     jobs, seen_names = [], set()
     for idx, row in enumerate(reader, start=1):
         vals = {(k.strip().lower() if k else k): v for k, v in row.items()}
+        if all((vals.get(c) or "") == "" for c in
+               ("prompt", "duration", "output_filename")):
+            continue  # fully blank row
         prompt = (vals.get("prompt") or "").strip() or FALLBACK_PROMPT
         lyrics = (vals.get("lyrics") or "").strip()
         try:
@@ -290,8 +296,6 @@ def parse_csv(path: Path) -> list[dict]:
             "duration": duration,
             "output_filename": filename,
         })
-    # drop fully-blank rows (no prompt content and defaulted everything is fine,
-    # but a row that had literally nothing useful is skipped)
     return jobs
 
 
@@ -379,6 +383,9 @@ def cmd_enqueue(args) -> int:
     jobs = parse_csv(csv_path)
     for j in jobs:
         j["session"] = session
+    if not jobs:
+        print("no valid rows", file=sys.stderr)
+        return EXIT_CONFIG
 
     rows = [("rows", len(jobs)), ("session", session),
             ("sample", f"{jobs[0]['id']}:{jobs[0]['output_filename']} "
@@ -388,9 +395,6 @@ def cmd_enqueue(args) -> int:
         print("\n--parse-only: first 3 would-be payloads:")
         for j in jobs[:3]:
             print(json.dumps(j))
-        return EXIT_OK
-    if not jobs:
-        print("nothing to enqueue")
         return EXIT_OK
 
     res = queue_push_jobs(jobs)
@@ -418,13 +422,15 @@ def build_node_env() -> dict:
 
 
 def cmd_up(args) -> int:
-    user = args.image.split("/")[0] if "/" in args.image else env_get("DOCKERHUB_USER")
-    tag = args.image.split("/")[-1] if "/" in args.image else env_get("ACESTEP_IMAGE_TAG", "latest")
-    repo = env_get("DOCKERHUB_USER")
-    image = args.image if "/" in args.image else f"{repo}/acestep-bxp:{tag}"
-    if not repo:
-        print("DOCKERHUB_USER not set in .env", file=sys.stderr)
-        return EXIT_CONFIG
+    if "/" in args.image:
+        image = args.image
+    else:
+        user = env_get("DOCKERHUB_USER")
+        if not user:
+            print("DOCKERHUB_USER not set in .env", file=sys.stderr)
+            return EXIT_CONFIG
+        tag = env_get("ACESTEP_IMAGE_TAG", "latest")
+        image = f"{user}/acestep-bxp:{tag}"
 
     name = args.name or f"acestream-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
     node_env = build_node_env()
@@ -437,6 +443,7 @@ def cmd_up(args) -> int:
         return EXIT_OK
 
     name = created["name"]
+    args.created_group = name
     print(f"group '{name}' created+start sent; waiting for running state...")
     deadline = time.time() + 15 * 60
     last = ""
@@ -523,10 +530,16 @@ def cmd_down(args) -> int:
         print(f"group '{args.name}' already gone")
         return EXIT_OK
     deadline = time.time() + 120
+    gone = False
     while time.time() < deadline:
         if salad_get_group(args.name) is None:
+            gone = True
             break
         time.sleep(5)
+    if not gone:
+        print(f"group '{args.name}' still exists - billing may continue.",
+              file=sys.stderr)
+        return EXIT_API
     print(f"DOWN: group '{args.name}' deleted - billing stopped.")
     return EXIT_OK
 
@@ -555,20 +568,27 @@ def cmd_run(args) -> int:
     try:
         argv = ["enqueue", "--csv", args.csv, "--session", session]
         ns = build_parser().parse_args(argv)
-        ns.func(ns)
+        rc = ns.func(ns)
+        if rc != EXIT_OK:
+            return rc
 
         argv = ["up", "--replicas", str(args.replicas)] + (
             ["--dry-run"] if args.dry_run else [])
         ns = build_parser().parse_args(argv)
-        ns.func(ns)
+        rc = ns.func(ns)
+        # grab the final (possibly conflict-suffixed) name returned by
+        # salad_create_group even on failure, so teardown still runs
+        group_name = getattr(ns, "created_group", None)
+        if rc != EXIT_OK:
+            return rc
         if args.dry_run:
             return EXIT_OK
 
-        # find actual group name (create may have suffixed it); simplest: newest
-        group_name = guess_newest_group(session)
         argv = ["watch", "--session", session, "--total", str(args.total or 0)]
         ns = build_parser().parse_args(argv)
-        ns.func(ns)
+        rc = ns.func(ns)
+        if rc != EXIT_OK:
+            return rc
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
@@ -588,20 +608,6 @@ def cmd_run(args) -> int:
           f" ({args.replicas} replicas x $0.35/hr)")
     print(browse_link(session))
     return EXIT_OK
-
-
-def guess_newest_group(_session: str):
-    try:
-        r = requests.get(
-            f"{SALAD_BASE}/organizations/{SALAD_ORG}/projects/"
-            f"{SALAD_PROJECT}/containers", headers=salad_headers(), timeout=60)
-        r.raise_for_status()
-        items = r.json() if isinstance(r.json(), list) else r.json().get("items", [])
-        ace = [c.get("name") for c in items
-               if str(c.get("name", "")).startswith("acestream-")]
-        return ace[-1] if ace else None
-    except Exception:  # noqa: BLE001
-        return None
 
 
 # ---------------------------------------------------------------- parser
