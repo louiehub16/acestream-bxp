@@ -609,7 +609,12 @@ def cmd_run(args) -> int:
                 print(f"WARN teardown failed: {e} - DELETE IT MANUALLY", file=sys.stderr)
             else:
                 for _ in range(24):
-                    if salad_get_group(gname) is None:
+                    try:
+                        still_there = salad_get_group(gname) is not None
+                    except Exception:  # noqa: BLE001
+                        time.sleep(5)
+                        continue
+                    if not still_there:
                         print("billing stopped.")
                         break
                     time.sleep(5)
@@ -683,5 +688,5 @@ if __name__ == "__main__":
     try:
         sys.exit(args.func(args))
     except KeyboardInterrupt:
-        print("\nctrl-c")
-        sys.exit(EXIT_OK)
+        print("interrupted")
+        sys.exit(EXIT_API)
