@@ -49,7 +49,6 @@ GPU_5090 = "851399fb-7329-4195-a042-d6514b28cf33"  # RTX 5090 (32 GB) in org luc
 # RTX 4090 (24 GB): faster to allocate; acestep-v15-xl fits in 24 GB. Set via
 # GPU_CLASSES env (comma-separated) to add it as a fallback pool.
 GPU_4090 = "ed563892-aacd-40f5-80b7-90c9be6c759b"
-ACCOUNT_ID = "abd12cd58366e2d99a202218328b1340"
 FALLBACK_PROMPT = "Cinematic industrial background layer"
 DURATION_MIN, DURATION_MAX = 10, 600
 LAST_CREATED_GROUP = None  # last successfully created Salad group (teardown fallback)
@@ -96,8 +95,14 @@ def gpu_classes() -> list[str]:
 
 
 def r2_endpoint_defaulted() -> str:
+    # fallback = current project's R2 account (used only when .env lacks the URL)
     return env_get("R2_ENDPOINT_URL",
-                   f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com")
+                   "https://ed7e009f1be708856dcea18da0cff38e.r2.cloudflarestorage.com")
+
+
+def cf_account_id() -> str:
+    """Derive the Cloudflare account id from the configured R2 endpoint URL."""
+    return r2_endpoint_defaulted().split("//")[-1].split(".")[0]
 
 
 # ---------------------------------------------------------------- http helper
@@ -804,7 +809,7 @@ def cmd_watch(args) -> int:
 
 def browse_link(session: str) -> str:
     bucket = env_get("R2_BUCKET_NAME")
-    return (f"https://dash.cloudflare.com/{ACCOUNT_ID}/r2/default/buckets/"
+    return (f"https://dash.cloudflare.com/{cf_account_id()}/r2/default/buckets/"
             f"{bucket}?prefix={session}%2F")
 
 
