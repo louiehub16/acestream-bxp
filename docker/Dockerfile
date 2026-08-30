@@ -42,16 +42,16 @@ RUN git clone https://github.com/ACE-Step/ACE-Step-1.5.git /app/ACE-Step-1.5 \
 
 WORKDIR /app/ACE-Step-1.5
 
-# 1) LEAN install: install ONLY the packages the ACE-Step API server + our
-#    sidecar need (skip gradio, vllm, torchcodec, training deps). This is the
-#    REAL slim step: it prevents the fat packages from ever entering a layer,
-#    so the image stays small (uv sync --frozen would pull the whole repo
-#    including gradio/vllm -> multi-GB wasted). If the API server later needs
-#    a package we skipped, add it here.
+# 1) Create venv, then LEAN install targeting the API-server runtime only.
+#    NOTE (verified from source): acestep/api_server.py is designed to be
+#    importable WITHOUT gradio (its own comment), and prefers the lightweight
+#    'pt' LM backend on Blackwell (no vllm). gptsol review flagged that a venv
+#    MUST exist before `uv pip install --python`. So: uv venv first.
+RUN uv venv .venv
 RUN uv pip install --python .venv/bin/python \
         torch torchaudio --index-url https://download.pytorch.org/whl/cu128 \
         transformers fastapi "uvicorn[standard]" requests python-multipart \
-        boto3 huggingface-hub vector-quantize-pytorch torchao \
+        boto3 huggingface-hub loguru python-dotenv vector-quantize-pytorch torchao \
         && rm -rf ~/.cache/uv
 
 ENV PATH="/app/ACE-Step-1.5/.venv/bin:${PATH}" \
