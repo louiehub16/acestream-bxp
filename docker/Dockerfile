@@ -43,13 +43,13 @@ RUN git clone https://github.com/ACE-Step/ACE-Step-1.5.git /app/ACE-Step-1.5 \
 WORKDIR /app/ACE-Step-1.5
 
 # 1) Create venv, then LEAN install targeting the API-server runtime only.
-#    NOTE (verified from source): acestep/api_server.py is designed to be
-#    importable WITHOUT gradio (its own comment), and prefers the lightweight
-#    'pt' LM backend on Blackwell (no vllm). gptsol review flagged that a venv
-#    MUST exist before `uv pip install --python`. So: uv venv first.
+#    NOTE: two separate install steps are REQUIRED - torch comes from the cu128
+#    index (has ONLY torch), everything else from default PyPI. Using --index-url
+#    on the combined line REPLACES PyPI and breaks transformers/fastapi resolution.
 RUN uv venv .venv
 RUN uv pip install --python .venv/bin/python \
-        torch torchaudio --index-url https://download.pytorch.org/whl/cu128 \
+        torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+RUN uv pip install --python .venv/bin/python \
         transformers fastapi "uvicorn[standard]" requests python-multipart \
         boto3 huggingface-hub loguru python-dotenv vector-quantize-pytorch torchao \
         && rm -rf ~/.cache/uv
