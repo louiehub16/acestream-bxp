@@ -42,27 +42,17 @@ RUN git clone https://github.com/ACE-Step/ACE-Step-1.5.git /app/ACE-Step-1.5 \
 
 WORKDIR /app/ACE-Step-1.5
 
-# 1) locked dependency set from the repo's uv.lock
-RUN uv sync --frozen --no-dev
-
-# 2) CUDA-12.8 torch builds (sm_120 need). --reinstall-package guarantees the
-#    cu128 wheel REPLACES the lock-pinned build installed by `uv sync`: plain
-#    `uv pip install` sees torch/torchaudio already satisfied and would
-#    silently no-op, leaving non-sm_120 kernels baked into the image.
-RUN uv pip install --python .venv/bin/python --reinstall-package torch --reinstall-package torchaudio \
-        torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-
-# 3) runtime deps of our sidecar + weight baking
-RUN uv pip install --python .venv/bin/python boto3 requests huggingface_hub
-
-# 4) SLIM: drop the heaviest packages the API-server path never imports - the
-#    Gradio UI and the vLLM/embedding stacks. The MM LM uses the lightweight
-#    'pt' backend (set in ENV below), so vLLM/nano-vllm are not needed. The
-#    API server DOES still need fastapi+uvicorn+accelerate - keep those.
-#    If a future change needs vLLM, remove this line and flip ACESTEP_LM_BACKEND to vllm.
-RUN uv pip uninstall --python .venv/bin/python -y \
-        gradio gradio-client nano-vllm vllm torchcodec 2>/dev/null || true \
-    && uv cache clean || true
+# 1) LEAN install: install ONLY the packages the ACE-Step API server + our
+#    sidecar need (skip gradio, vllm, torchcodec, training deps). This is the
+#    REAL slim step: it prevents the fat packages from ever entering a layer,
+#    so the image stays small (uv sync --frozen would pull the whole repo
+#    including gradio/vllm -> multi-GB wasted). If the API server later needs
+#    a package we skipped, add it here.
+RUN uv pip install --python .venv/bin/python \
+        torch torchaudio --index-url https://download.pytorch.org/whl/cu128 \
+        transformers fastapi "uvicorn[standard]" requests python-multipart \
+        boto3 huggingface-hub vector-quantize-pytorch torchao \
+        && rm -rf ~/.cache/uv
 
 ENV PATH="/app/ACE-Step-1.5/.venv/bin:${PATH}" \
     HF_HOME=/hf-cache \

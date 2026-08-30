@@ -62,6 +62,26 @@ done
   done
 ) &
 
+# --- OBSERVABILITY: heartbeat + log tail -> R2 (debug the 'alive but stuck' gap)
+# Ships the ACE-Step server's real last log lines to R2 every 30s so the outside
+# watcher sees exactly where model-load/generation is - no SSH needed. Uses the
+# venv boto3 (PATH already points there). Non-fatal: never brings the container down.
+if [[ -n "${R2_BUCKET_NAME:-}" && -n "${R2_ENDPOINT_URL:-}" ]]; then
+  HB_KEY="state/heartbeat_${NODE_NAME:-$(hostname)}.txt"
+  (
+    while true; do
+      sleep 30
+      PLOG="$(tail -c 2000 "${LOG}" 2>/dev/null | tr '\n' '|' | tail -c 2000)"
+      HOST="$(hostname)"
+      printf 'host=%s ts=%s alive | PLOG: %s' \
+        "${HOST}" "$(date -u +%FT%TZ)" "${PLOG}" | \
+        python -c "import boto3,sys,os; boto3.client('s3', endpoint_url=os.environ['R2_ENDPOINT_URL'], aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'], aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'], region_name='auto').put_object(Bucket=os.environ['R2_BUCKET_NAME'], Key='${HB_KEY}', Body=sys.stdin.buffer.read())" \
+        2>/dev/null || true
+    done
+  ) &
+  echo "[entrypoint] heartbeat+PLOG -> state/heartbeat_${NODE_NAME:-$(hostname)}.txt"
+fi
+
 # --- sidecar supervisor (foreground-ish forever loop) ---------------------------
 echo "[entrypoint] launching sidecar supervisor"
 while true; do
