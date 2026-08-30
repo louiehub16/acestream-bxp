@@ -55,13 +55,22 @@ RUN uv pip install --python .venv/bin/python --reinstall-package torch --reinsta
 # 3) runtime deps of our sidecar + weight baking
 RUN uv pip install --python .venv/bin/python boto3 requests huggingface_hub
 
+# 4) SLIM: drop the heaviest packages the API-server path never imports - the
+#    Gradio UI and the vLLM/embedding stacks. The MM LM uses the lightweight
+#    'pt' backend (set in ENV below), so vLLM/nano-vllm are not needed. The
+#    API server DOES still need fastapi+uvicorn+accelerate - keep those.
+#    If a future change needs vLLM, remove this line and flip ACESTEP_LM_BACKEND to vllm.
+RUN uv pip uninstall --python .venv/bin/python -y \
+        gradio gradio-client nano-vllm vllm torchcodec 2>/dev/null || true \
+    && uv cache clean || true
+
 ENV PATH="/app/ACE-Step-1.5/.venv/bin:${PATH}" \
     HF_HOME=/hf-cache \
     ACESTEP_API_HOST="::" \
     ACESTEP_API_PORT=8001 \
     ACESTEP_CONFIG_PATH=acestep-v15-xl-turbo \
     ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-4B \
-    ACESTEP_LM_BACKEND=vllm
+    ACESTEP_LM_BACKEND=pt
 
 # --- OPTIONAL: bake weights at build time --------------------------------------
 # Heredoc RUN keeps the python script readable; BuildKit syntax 1.4+ required.
