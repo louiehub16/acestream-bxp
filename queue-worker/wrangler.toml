@@ -12,8 +12,9 @@
 name = "acestream-queue"
 main = "src/index.js"
 compatibility_date = "2025-03-01"
+workers_dev = true
 
 [[d1_databases]]
 binding = "DB"
 database_name = "acestream-queue"
-database_id = "PLACEHOLDER_run_wrangler_d1_create_acestream-queue"
+database_id = "c1dca1f9-09aa-47b0-bccd-63718dbdefe7"

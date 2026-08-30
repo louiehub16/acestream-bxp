@@ -121,8 +121,10 @@ def retry_call(fn, tries: int = 3, backoff: float = 3.0, what: str = "call"):
 
 # ---------------------------------------------------------------- salad api
 def salad_headers():
+    # Explicit UA required: Salad 403-blocks UA-less clients (bare urllib).
     return {"Salad-Api-Key": env_get("SALAD_API_KEY"),
-            "Content-Type": "application/json"}
+            "Content-Type": "application/json",
+            "User-Agent": "acestream-bxp/1.0"}
 
 
 def salad_create_group(name: str, image: str, replicas: int, node_env: dict,
