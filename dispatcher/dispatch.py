@@ -640,12 +640,19 @@ def cmd_validate(_args) -> int:
         failures.append(f"R2 unreachable: {e}")
 
     try:
+        # auth proof via /gpu-classes (a proven-live endpoint; the bare
+        # /projects list 404s on this API), then list container groups.
         r = requests.get(
-            f"{SALAD_BASE}/organizations/{SALAD_ORG}/projects",
+            f"{SALAD_BASE}/organizations/{SALAD_ORG}/gpu-classes",
             headers=salad_headers(), timeout=60)
         r.raise_for_status()
-        names = [p.get("name") for p in r.json()]
-        print(f"salad      OK  auth valid; projects={names}")
+        classes = [g.get("name") for g in r.json().get("items", [])][:3]
+        rc = requests.get(
+            f"{SALAD_BASE}/organizations/{SALAD_ORG}/projects/{SALAD_PROJECT}/containers",
+            headers=salad_headers(), timeout=60)
+        rc.raise_for_status()
+        groups = [g.get("name") for g in rc.json().get("items", [])]
+        print(f"salad      OK  auth valid; sample GPUs={classes}; groups={groups}")
     except Exception as e:  # noqa: BLE001
         failures.append(f"Salad API auth failed: {e}")
 
