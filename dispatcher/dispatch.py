@@ -143,6 +143,7 @@ def salad_create_group(name: str, image: str, replicas: int, node_env: dict,
             "environment_variables": node_env,
         },
         "replicas": replicas,
+        "autostart_policy": True,
     }
     if dry_run:
         return body
@@ -195,9 +196,20 @@ def salad_delete_group(name: str) -> bool:
 
 
 def salad_start_group(name):
-    retry_call(lambda: requests.post(
-        f"{SALAD_BASE}/organizations/{SALAD_ORG}/projects/{SALAD_PROJECT}/containers/{name}/start",
-        headers=salad_headers(), timeout=60).raise_for_status(), what="salad-start")
+    # Best-effort only: with autostart_policy=true the group deploys on its own.
+    # Salad rejects /start while the group is still in Pending (400), which is
+    # normal right after create - so swallow those and rely on autostart.
+    try:
+        r = requests.post(
+            f"{SALAD_BASE}/organizations/{SALAD_ORG}/projects/{SALAD_PROJECT}/containers/{name}/start",
+            headers=salad_headers(), timeout=60)
+        if r.status_code in (200, 202):
+            return True
+        print(f"  [salad-start] {r.status_code} (autostart will handle deployment)")
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"  [salad-start] best-effort failed: {e}")
+        return False
 
 
 def salad_logs(name: str):
@@ -745,7 +757,7 @@ def cmd_up(args) -> int:
         print(f"start failed: {e}", file=sys.stderr)
         return EXIT_API
     print(f"group '{name}' created+start sent; waiting for running state...")
-    deadline = time.time() + 15 * 60
+    deadline = time.time() + int(os.getenv("UP_WAIT_SECONDS", "21600"))  # 6 hr: 14.79GB image pulls very slowly on Salad's consumer nodes; covers the one-time first pull (Salad caches layers fleet-wide after first boot)
     last = ""
     while time.time() < deadline:
         g = salad_get_group(name)
