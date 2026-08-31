@@ -48,9 +48,9 @@ WORKDIR /app/ACE-Step-1.5
 #    on the combined line REPLACES PyPI and breaks transformers/fastapi resolution.
 RUN uv venv .venv
 RUN uv pip install --python .venv/bin/python \
-        torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+        "torch==2.10.0+cu128" "torchaudio==2.10.0+cu128" --index-url https://download.pytorch.org/whl/cu128
 RUN uv pip install --python .venv/bin/python \
-        transformers fastapi "uvicorn[standard]" requests python-multipart \
+        "transformers>=4.51,<4.58" fastapi "uvicorn[standard]" requests python-multipart \
         boto3 huggingface-hub loguru python-dotenv vector-quantize-pytorch torchao \
         soundfile numpy pydantic safetensors einops starlette tqdm rich pyyaml diskcache xxhash \
         gradio matplotlib pillow \
