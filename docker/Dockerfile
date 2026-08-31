@@ -53,7 +53,7 @@ RUN uv pip install --python .venv/bin/python \
         transformers fastapi "uvicorn[standard]" requests python-multipart \
         boto3 huggingface-hub loguru python-dotenv vector-quantize-pytorch torchao \
         soundfile numpy pydantic safetensors einops starlette tqdm rich pyyaml diskcache xxhash \
-        gradio \
+        gradio matplotlib pillow \
         && rm -rf ~/.cache/uv
 
 ENV PATH="/app/ACE-Step-1.5/.venv/bin:${PATH}" \
