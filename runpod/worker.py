@@ -3,25 +3,24 @@
 RunPod Serverless Worker — ACE-Step 1.5 xl-turbo on 24 GB (RTX 4090/3090/A10G).
 SINGLE-PROCESS, MODELS-WARM architecture (fixed deadlock + cold-start dispatch).
 
-FIXES:
-  - Deadlock: no subprocess web-server. We build the ACE-Step FastAPI app
-    in-process and keep a persistent TestClient open, so the app's lifespan
-    (model download+load + worker daemons) runs ONCE at boot and stays warm.
-  - Cold-start dispatch: finding a ready-but-idle worker that never takes a job
-    was because the model load was deferred into the lifespan and the worker
-    wasn't truly ready. By warming models in GLOBAL scope we guarantee the first
-    job hits a ready worker. RUNPOD_INIT_TIMEOUT=800 extends the boot budget.
-  - single process / 'pt' LM backend avoids vLLM/vRAM fragmentation on 24GB.
-
-The one persistent TestClient keeps the FastAPI app + lifespan alive for the
-whole worker process, so every job rides warm models (no per-request reload).
+gptsol review fixes incorporated (see review at %TEMP%/gptsol_worker_review.txt):
+ - shift=3.0 sent explicitly (ACE-Step default is already 3.0, make it explicit).
+ - /query_result parsed with INT status (0=running,1=success,2=failed) per the
+   true API (query_result_service.py), not guessed.
+ - audio extracted from result.audios[].path (the documented output field), not
+   a recursive find_audio.
+ - process-wide lock around _render (RunPod can invoke concurrent jobs).
+ - R2 env validated at boot; fail fast.
 """
 import json
 import os
+import threading
 import time
 import traceback
 
+import boto3
 import runpod
+from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # GLOBAL INIT: build the app + warm the models via its lifespan ONCE.
@@ -36,87 +35,107 @@ os.environ.setdefault("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B")
 os.environ.setdefault("ACESTEP_LM_BACKEND", "pt")
 os.environ.setdefault("ACESTEP_API_HOST", "0.0.0.0")
 os.environ.setdefault("ACESTEP_API_PORT", "8001")
-os.environ.setdefault("RUNPOD_INIT_TIMEOUT", "800")   # >7min cold-start budget
+os.environ.setdefault("RUNPOD_INIT_TIMEOUT", "800")
 
-from acestep.api_server import create_app
-app = create_app()
-
-from fastapi.testclient import TestClient
-# Opening the TestClient as a persistent context runs app.lifespan() -> loads
-# xl-turbo + LM and starts the API worker daemons, then keeps them alive.
-_client = TestClient(app)
-_client.__enter__()
-print(f"[worker] ACE-Step app warmed on {torch.cuda.get_device_name(0)}", flush=True)
-
+# Validate R2 env at boot (gptsol #11): fail fast, don't waste a full render.
 R2_ENDPOINT = os.getenv("R2_ENDPOINT_URL")
 R2_AKID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SAK = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET_NAME", "music-generations")
+for _k, _v in [("R2_ENDPOINT_URL", R2_ENDPOINT), ("R2_ACCESS_KEY_ID", R2_AKID),
+               ("R2_SECRET_ACCESS_KEY", R2_SAK)]:
+    if not _v:
+        raise RuntimeError(f"missing required env {_k}")
+
+
+from acestep.api_server import create_app
+app = create_app()
+
+# Persistent TestClient runs app.lifespan() once -> loads xl-turbo + LM, starts
+# the API worker daemons, and keeps them alive across the whole worker process.
+_client = TestClient(app)
+_client.__enter__()
+print(f"[worker] ACE-Step app warmed on {torch.cuda.get_device_name(0)}", flush=True)
+
+_render_lock = threading.Lock()
 
 
 def _render(prompt, lyrics, duration_s) -> bytes:
-    """Drive one generation through the warm app (release_task -> poll -> audio)."""
-    r = _client.post("/release_task", json={
-        "prompt": prompt,
-        "lyrics": lyrics or "",
-        "audio_duration": float(duration_s),
-        "guidance_scale": 7.0,
-    })
-    if r.status_code != 200:
-        raise RuntimeError(f"release_task HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json().get("data", r.json())
-    task_id = data.get("task_id") or data.get("id")
-    if not task_id:
-        raise RuntimeError("no task_id")
+    """Drive one generation through the warm app. Serialized via _render_lock."""
+    with _render_lock:
+        r = _client.post("/release_task", json={
+            "prompt": prompt,
+            "lyrics": lyrics or "",
+            "audio_duration": float(duration_s),
+            "guidance_scale": 7.0,
+            "shift": 3.0,          # turbo timestep factor (default is 3.0; make explicit)
+        })
+        r.raise_for_status()
+        data = r.json().get("data", r.json())
+        task_id = data.get("task_id") or data.get("id")
+        if not task_id:
+            raise RuntimeError("no task_id")
 
-    deadline = time.time() + 1800
-    result = None
-    while time.time() < deadline:
-        time.sleep(5)
-        qr = _client.post("/query_result", json={"task_id_list": [task_id]})
-        qd = qr.json().get("data", qr.json())
-        tasks = qd.get("tasks") if isinstance(qd, dict) else None
-        task = (tasks[0] if tasks else None) or (
-            qd[0] if isinstance(qd, list) and qd else None)
-        if task is None:
-            continue
-        st = task.get("status")
-        if st == 1:
-            result = task
-            break
-        if st == 2:
-            raise RuntimeError(f"gen failed: {task}")
-    if result is None:
-        raise RuntimeError("gen timeout")
+        deadline = time.time() + 1800
+        while time.time() < deadline:
+            time.sleep(5)
+            qr = _client.post("/query_result", json={"task_id_list": [task_id]})
+            qr.raise_for_status()
+            qd = qr.json().get("data", qr.json())
+            tasks = qd.get("tasks") if isinstance(qd, dict) else qd
+            if isinstance(tasks, list) and tasks:
+                task = tasks[0]
+            else:
+                continue
+            status = task.get("status")
+            # int status: 0=running, 1=success, 2=failed (per query_result_service.py)
+            if status == 1:
+                break
+            if status == 2:
+                raise RuntimeError(f"gen failed: {str(task)[:300]}")
+        else:
+            raise RuntimeError("gen timeout")
 
-    def find_audio(obj, d=0):
-        if d > 8 or obj is None:
-            return None
-        if isinstance(obj, str) and (obj.lower().endswith((".wav", ".mp3")) or obj.startswith(("/", "http"))):
-            return obj
-        if isinstance(obj, dict):
-            for v in obj.values():
-                f = find_audio(v, d + 1)
-                if f:
-                    return f
-        if isinstance(obj, (list, tuple)):
-            for v in obj:
-                f = find_audio(v, d + 1)
-                if f:
-                    return f
-        return None
+        # extract the documented output audio path (result.audios[].path)
+        result = task.get("result", "")
+        audio_path = None
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = None
+        if isinstance(result, list) and result:
+            audios = result[0].get("audios") if isinstance(result[0], dict) else None
+            if isinstance(audios, list) and audios and isinstance(audios[0], dict):
+                audio_path = audios[0].get("path") or audios[0].get("audio_path")
+        if not audio_path:
+            # fallback: scan result for any .wav path
+            def _find(obj, d=0):
+                if d > 6 or obj is None:
+                    return None
+                if isinstance(obj, str) and obj.lower().endswith(".wav"):
+                    return obj
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        f = _find(v, d + 1)
+                        if f:
+                            return f
+                if isinstance(obj, list):
+                    for v in obj:
+                        f = _find(v, d + 1)
+                        if f:
+                            return f
+                return None
+            audio_path = _find(result)
+        if not audio_path:
+            raise RuntimeError("no audio path in result")
 
-    audio_ref = find_audio(result)
-    if not audio_ref:
-        raise RuntimeError(f"no audio in result: {list(result)[:8]}")
-    ar = _client.get("/v1/audio", params={"path": audio_ref})
-    if ar.status_code != 200:
-        raise RuntimeError(f"/v1/audio HTTP {ar.status_code}")
-    return ar.content
+        ar = _client.get("/v1/audio", params={"path": audio_path})
+        ar.raise_for_status()
+        return ar.content
 
 
 def _upload(data: bytes, key: str) -> str:
-    import boto3
     s3 = boto3.client(
         "s3", endpoint_url=R2_ENDPOINT,
         aws_access_key_id=R2_AKID, aws_secret_access_key=R2_SAK, region_name="auto")
