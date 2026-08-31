@@ -29,6 +29,9 @@ os.environ.setdefault("ACESTEP_LM_BACKEND", "pt")
 os.environ.setdefault("ACESTEP_API_HOST", "0.0.0.0")
 os.environ.setdefault("ACESTEP_API_PORT", "8001")
 os.environ.setdefault("RUNPOD_INIT_TIMEOUT", "800")
+# Model load crashed with 'Failed to load model with attention' because
+# flash-attn-2 is unavailable (needs GPU-local build). Force SDPA/eager.
+os.environ.setdefault("ACESTEP_USE_FLASH_ATTENTION", "false")
 
 _init_lock = threading.Lock()
 _client = None            # persistent TestClient (kept warm after first init)
@@ -94,7 +97,7 @@ def _render(prompt, lyrics, duration_s) -> bytes:
         if status == 1:
             break
         if status == 2:
-            raise RuntimeError(f"gen failed: {str(task)[:300]}")
+            raise RuntimeError(f"gen failed: {str(task)[:2000]}")
     else:
         raise RuntimeError("gen timeout")
     result = task.get("result", "")
