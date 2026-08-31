@@ -163,13 +163,29 @@ def handler(job):
     # Capture ALL stdout/stderr for this job into a buffer -> R2
     old_out, old_err = sys.stdout, sys.stderr
     buf = io.StringIO()
-    log_lines = []
+    _log_lock = threading.Lock()
 
-    def tee_write(s):
-        buf.write(s)
-        old_out.write(s)
-    sys.stdout = type("Tee", (), {"write": tee_write, "flush": lambda self: old_out.flush()})()
-    sys.stderr = sys.stdout
+    class _Tee:
+        def __init__(self, target_out, target_err, buffer):
+            self._out = target_out
+            self._err = target_err
+            self._buf = buffer
+        def write(self, s):
+            with _log_lock:
+                self._buf.write(s)
+            try:
+                self._out.write(s)
+            except Exception:
+                pass
+            return len(s)
+        def flush(self):
+            try:
+                self._out.flush()
+            except Exception:
+                pass
+    tee = _Tee(old_out, old_err, buf)
+    sys.stdout = tee
+    sys.stderr = tee
 
     out = os.path.basename(output.replace("\\", "/"))
     out = "".join(c for c in out if c.isalnum() or c in "._-") or "song.wav"
