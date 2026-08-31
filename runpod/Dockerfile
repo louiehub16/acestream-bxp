@@ -40,7 +40,7 @@ RUN uv pip install --python .venv/bin/python \
         "transformers>=4.51,<4.58" fastapi "uvicorn[standard]" requests python-multipart \
         boto3 huggingface-hub loguru python-dotenv vector-quantize-pytorch torchao \
         "runpod>=1.9.0" soundfile numpy pydantic safetensors einops starlette tqdm rich pyyaml diskcache xxhash \
-        gradio matplotlib pillow \
+        gradio matplotlib pillow diffusers \
         && rm -rf ~/.cache/uv
 
 # install the ace-step package itself (no deps - we supply them leanly)
