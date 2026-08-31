@@ -1,73 +1,52 @@
 #!/usr/bin/env python3
 """
-RunPod Serverless Worker — ACE-Step 1.5 xl-turbo on RTX 4090.
-SINGLE-PROCESS / NO-SUBPROCESS architecture.
+RunPod Serverless Worker — ACE-Step 1.5 xl-turbo on 24 GB (RTX 4090/3090/A10G).
+SINGLE-PROCESS, MODELS-WARM architecture (fixed deadlock + cold-start dispatch).
 
-FIXES the previous deadlock: booting `acestep.api_server` as a subprocess
-inside a serverless worker blocked RunPod's stdout/queue handshake and the job
-stuck IN_QUEUE forever. Here we instead:
+FIXES:
+  - Deadlock: no subprocess web-server. We build the ACE-Step FastAPI app
+    in-process and keep a persistent TestClient open, so the app's lifespan
+    (model download+load + worker daemons) runs ONCE at boot and stays warm.
+  - Cold-start dispatch: finding a ready-but-idle worker that never takes a job
+    was because the model load was deferred into the lifespan and the worker
+    wasn't truly ready. By warming models in GLOBAL scope we guarantee the first
+    job hits a ready worker. RUNPOD_INIT_TIMEOUT=800 extends the boot budget.
+  - single process / 'pt' LM backend avoids vLLM/vRAM fragmentation on 24GB.
 
-  1. Build the ACE-Step FastAPI app IN-PROCESS via `create_app()` at container
-     boot (global scope). This triggers the heavy model download+load ONCE,
-     using the repo's own tested initialization.
-  2. Run one generation through the app's own ASGI callable (fully tested
-     pipeline: parse -> store -> run_blocking_generate -> result) - no
-     subprocess, no deadlock.
-  3. Upload the resulting WAV to Cloudflare R2 + return a presigned link.
-
-GPU: RTX 4090 (24 GB). xl-turbo DiT + 5Hz LM fit in 24GB with LLM backend 'pt'
-(PyTorch native, single process) - avoids vLLM's separate memory mapping which
-fragments on consumer cards.
-
-IMPORTANT: shift=3.0 for xl-turbo timestep scaling (default 1.0 -> silence/hiss).
-Cold start: model download+load ~30-60s -> set RunPod container boot timeout >=120s.
+The one persistent TestClient keeps the FastAPI app + lifespan alive for the
+whole worker process, so every job rides warm models (no per-request reload).
 """
 import json
 import os
+import time
 import traceback
 
 import runpod
 
 # ---------------------------------------------------------------------------
-# FITNESS CHECK (docs: serverless/development/fitness-checks): Runpod runs
-# registered checks BEFORE the worker takes traffic. Validates the GPU is
-# usable so a broken worker is marked unhealthy + replaced, not failing jobs.
-# Requires runpod>=1.9.0. Runs once at startup then is skipped.
+# GLOBAL INIT: build the app + warm the models via its lifespan ONCE.
 # ---------------------------------------------------------------------------
-@runpod.serverless.register_fitness_check
-def check_gpu_available():
-    import torch
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU not available")
-    gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    if gb < 8:
-        raise RuntimeError(f"GPU VRAM insufficient: {gb:.1f}GB")
-
-
-# ---------------------------------------------------------------------------
-# GLOBAL INIT: build the ACE-Step app once at container boot (not per request).
-# This downloads/loads xl-turbo + LM once and keeps them resident.
-# ---------------------------------------------------------------------------
-print("[worker] building ACE-Step app in-process (global init)...", flush=True)
+print("[worker] warm-boot: building ACE-Step app in-process...", flush=True)
 
 import torch
 torch.cuda.init()
 
-# env: force pt backend, xl-turbo config, 0.6B LM (fits 24GB)
 os.environ.setdefault("ACESTEP_CONFIG_PATH", "acestep-v15-xl-turbo")
 os.environ.setdefault("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-0.6B")
 os.environ.setdefault("ACESTEP_LM_BACKEND", "pt")
 os.environ.setdefault("ACESTEP_API_HOST", "0.0.0.0")
 os.environ.setdefault("ACESTEP_API_PORT", "8001")
-
-# KEY (docs: development/optimization): extend the worker's cold-start budget so
-# the model download+load (~30-60s+) isn't misread as dead. Without this a worker
-# that takes >7 min to boot is marked unhealthy and never takes jobs.
-os.environ.setdefault("RUNPOD_INIT_TIMEOUT", "800")
+os.environ.setdefault("RUNPOD_INIT_TIMEOUT", "800")   # >7min cold-start budget
 
 from acestep.api_server import create_app
-app = create_app()          # builds handlers + wires run_blocking_generate
-print(f"[worker] app built on {torch.cuda.get_device_name(0)}", flush=True)
+app = create_app()
+
+from fastapi.testclient import TestClient
+# Opening the TestClient as a persistent context runs app.lifespan() -> loads
+# xl-turbo + LM and starts the API worker daemons, then keeps them alive.
+_client = TestClient(app)
+_client.__enter__()
+print(f"[worker] ACE-Step app warmed on {torch.cuda.get_device_name(0)}", flush=True)
 
 R2_ENDPOINT = os.getenv("R2_ENDPOINT_URL")
 R2_AKID = os.getenv("R2_ACCESS_KEY_ID")
@@ -75,80 +54,65 @@ R2_SAK = os.getenv("R2_SECRET_ACCESS_KEY")
 R2_BUCKET = os.getenv("R2_BUCKET_NAME", "music-generations")
 
 
-def _render(prompt, lyrics, duration_s, shift=3.0, guidance=7.0) -> bytes:
-    """Run one generation in-process via the app's own generation path.
-    Returns raw WAV bytes. Uses the app's method that maps a request to audio."""
-    import asyncio
-    from fastapi.testclient import TestClient
-    from acestep.api.http.release_task_models import GenerateMusicRequest
+def _render(prompt, lyrics, duration_s) -> bytes:
+    """Drive one generation through the warm app (release_task -> poll -> audio)."""
+    r = _client.post("/release_task", json={
+        "prompt": prompt,
+        "lyrics": lyrics or "",
+        "audio_duration": float(duration_s),
+        "guidance_scale": 7.0,
+    })
+    if r.status_code != 200:
+        raise RuntimeError(f"release_task HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json().get("data", r.json())
+    task_id = data.get("task_id") or data.get("id")
+    if not task_id:
+        raise RuntimeError("no task_id")
 
-    # Build the request object the app's route expects
-    req = GenerateMusicRequest(
-        prompt=prompt,
-        lyrics=lyrics or "",
-        audio_duration=float(duration_s),
-        guidance_scale=guidance,
-    )
-    # The app exposes the blocking generation; use TestClient to drive /release_task
-    # synchronously (in-process, no subprocess, no real network).
-    with TestClient(app) as client:
-        r = client.post("/release_task", json={
-            "prompt": prompt,
-            "lyrics": lyrics or "",
-            "audio_duration": float(duration_s),
-            "guidance_scale": guidance,
-        })
-        if r.status_code != 200:
-            raise RuntimeError(f"release_task HTTP {r.status_code}: {r.text[:300]}")
-        data = r.json().get("data", r.json())
-        task_id = data.get("task_id") or data.get("id")
-        if not task_id:
-            raise RuntimeError("no task_id")
+    deadline = time.time() + 1800
+    result = None
+    while time.time() < deadline:
+        time.sleep(5)
+        qr = _client.post("/query_result", json={"task_id_list": [task_id]})
+        qd = qr.json().get("data", qr.json())
+        tasks = qd.get("tasks") if isinstance(qd, dict) else None
+        task = (tasks[0] if tasks else None) or (
+            qd[0] if isinstance(qd, list) and qd else None)
+        if task is None:
+            continue
+        st = task.get("status")
+        if st == 1:
+            result = task
+            break
+        if st == 2:
+            raise RuntimeError(f"gen failed: {task}")
+    if result is None:
+        raise RuntimeError("gen timeout")
 
-        # poll query_result (in-process)
-        import time
-        deadline = time.time() + 1500
-        result = None
-        while time.time() < deadline:
-            time.sleep(5)
-            qr = client.post("/query_result", json={"task_id_list": [task_id]})
-            qd = qr.json().get("data", qr.json())
-            tasks = qd.get("tasks") if isinstance(qd, dict) else None
-            task = (tasks[0] if tasks else None) or (
-                qd[0] if isinstance(qd, list) and qd else None)
-            if task is None:
-                continue
-            st = task.get("status")
-            if st == 1:
-                result = task
-                break
-            if st == 2:
-                raise RuntimeError(f"gen failed: {task}")
-        if result is None:
-            raise RuntimeError("gen timeout")
-        # find audio path
-        def find_audio(obj, d=0):
-            if d > 8 or obj is None:
-                return None
-            if isinstance(obj, str) and (obj.lower().endswith((".wav",".mp3")) or obj.startswith(("/","http"))):
-                return obj
-            if isinstance(obj, dict):
-                for v in obj.values():
-                    f = find_audio(v, d+1)
-                    if f: return f
-            if isinstance(obj, (list, tuple)):
-                for v in obj:
-                    f = find_audio(v, d+1)
-                    if f: return f
+    def find_audio(obj, d=0):
+        if d > 8 or obj is None:
             return None
-        audio_ref = find_audio(result)
-        if not audio_ref:
-            raise RuntimeError(f"no audio in result: {list(result)[:8]}")
-        # download via app's audio route (in-process)
-        ar = client.get(f"/v1/audio", params={"path": audio_ref})
-        if ar.status_code != 200:
-            raise RuntimeError(f"/v1/audio HTTP {ar.status_code}")
-        return ar.content
+        if isinstance(obj, str) and (obj.lower().endswith((".wav", ".mp3")) or obj.startswith(("/", "http"))):
+            return obj
+        if isinstance(obj, dict):
+            for v in obj.values():
+                f = find_audio(v, d + 1)
+                if f:
+                    return f
+        if isinstance(obj, (list, tuple)):
+            for v in obj:
+                f = find_audio(v, d + 1)
+                if f:
+                    return f
+        return None
+
+    audio_ref = find_audio(result)
+    if not audio_ref:
+        raise RuntimeError(f"no audio in result: {list(result)[:8]}")
+    ar = _client.get("/v1/audio", params={"path": audio_ref})
+    if ar.status_code != 200:
+        raise RuntimeError(f"/v1/audio HTTP {ar.status_code}")
+    return ar.content
 
 
 def _upload(data: bytes, key: str) -> str:
