@@ -50,12 +50,43 @@ fi
 
 # --- 2. create the serverless endpoint (RTX 4090 / ADA_24) ----------------------
 say "creating RunPod endpoint '$ENDPOINT' (RTX 4090)..."
-curl -s -m 60 -X POST "https://api.runpod.io/v2/serverless" \
-  -H "Authorization: Bearer $RUNPOD_KEY" -H "Content-Type: application/json" \
-  -d "{\"name\":\"$ENDPOINT\",\"type\":\"QUEUE\",\"image\":\"$IMAGE\",\"gpu\":{\"pools\":[\"ADA_24\"]},\"scaling\":{\"type\":\"REQUEST_COUNT\",\"requestCount\":1}}" \
-  | tee /tmp/runpod_endpoint.json
+# Build the create payload with Python so env vars (R2 creds) are injected exactly.
+# Docs (endpoint-configurations): queue type, gpu.pools (pool IDs), scaling
+# REQUEST_COUNT, disk, container env vars.
+python3 - "$REPO_DIR/.env" "$ENDPOINT" "$IMAGE" <<'PY' > /tmp/runpod_endpoint.json
+import json, os, sys
+env_path, endpoint, image = sys.argv[1], sys.argv[2], sys.argv[3]
+# load .env
+e = {}
+for line in open(env_path, encoding="utf-8"):
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, _, v = line.partition("="); e[k.strip()] = v.strip()
+# the env the worker + ACE-Step need
+container_env = {
+    "R2_ENDPOINT_URL": e.get("R2_ENDPOINT_URL", ""),
+    "R2_ACCESS_KEY_ID": e.get("R2_ACCESS_KEY_ID", ""),
+    "R2_SECRET_ACCESS_KEY": e.get("R2_SECRET_ACCESS_KEY", ""),
+    "R2_BUCKET_NAME": e.get("R2_BUCKET_NAME", "music-generations"),
+    "ACESTEP_CONFIG_PATH": "acestep-v15-xl-turbo",
+    "ACESTEP_LM_MODEL_PATH": "acestep-5Hz-lm-0.6B",
+    "ACESTEP_LM_BACKEND": "pt",
+    "ACESTEP_INIT_LLM": "true",
+    "RUNPOD_INIT_TIMEOUT": "800",
+}
+payload = {
+    "name": endpoint,
+    "type": "QUEUE",
+    "image": image,
+    "gpu": {"pools": ["ADA_24"]},          # RTX 4090 / RTX 6000 Ada
+    "scaling": {"type": "REQUEST_COUNT", "requestCount": 1},
+    "disk": 60,
+    "env": container_env,                  # passed to the worker container
+}
+print(json.dumps(payload))
+PY
 ENDPOINT_ID="$(python3 -c "import json;print(json.load(open('/tmp/runpod_endpoint.json')).get('id',''))")"
-[ -n "$ENDPOINT_ID" ] || die "endpoint create failed (see above)"
+[ -n "$ENDPOINT_ID" ] || { echo "endpoint create failed:"; cat /tmp/runpod_endpoint.json; exit 1; }
 say "endpoint id: $ENDPOINT_ID"
 
 # scale up max workers for bulk (RTX 4090 pool)

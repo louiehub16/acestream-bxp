@@ -38,8 +38,8 @@ RUN uv pip install --python .venv/bin/python \
         torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 RUN uv pip install --python .venv/bin/python \
         transformers fastapi "uvicorn[standard]" requests python-multipart \
-        boto3 huggingface-hub loguru python-dotenv vector-quantize-pytorch torchao runpod \
-        soundfile numpy pydantic safetensors einops starlette tqdm rich pyyaml diskcache xxhash \
+        boto3 huggingface-hub loguru python-dotenv vector-quantize-pytorch torchao \
+        "runpod>=1.9.0" soundfile numpy pydantic safetensors einops starlette tqdm rich pyyaml diskcache xxhash \
         && rm -rf ~/.cache/uv
 
 # install the ace-step package itself (no deps - we supply them leanly)
@@ -52,14 +52,18 @@ ENV PATH="/workspace/.venv/bin:${PATH}" \
     ACESTEP_CONFIG_PATH=acestep-v15-xl-turbo \
     ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-0.6B \
     ACESTEP_LM_BACKEND=pt \
-    ACESTEP_INIT_LLM=true
+    ACESTEP_INIT_LLM=true \
+    RUNPOD_INIT_TIMEOUT=800
 
 COPY runpod/worker.py /workspace/worker.py
+# local-testing convenience: test_input.json drives local `python worker.py`
+COPY runpod/test_input.json /workspace/test_input.json
 
 EXPOSE 8001
 
-# RunPod serverless entrypoint: the worker registers the handler and long-polls
-CMD ["python", "/workspace/worker.py"]
+# RunPod serverless entrypoint: the worker registers the handler and long-polls.
+# -u = unbuffered (docs recommend it for serverless logging).
+CMD ["python3", "-u", "/workspace/worker.py"]
 
 LABEL org.opencontainers.image.title="acestep-runpod" \
       org.opencontainers.image.description="ACE-Step 1.5 xl-turbo RunPod serverless worker (RTX 4090)" \

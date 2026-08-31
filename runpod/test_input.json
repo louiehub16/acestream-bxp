@@ -1,0 +1,9 @@
+{
+  "input": {
+    "prompt": "Sunset driving synthwave track, 124 BPM, warm analog pads, punchy gated drums, a clean arpeggiated lead, cinematic outro",
+    "lyrics": "",
+    "duration": 240,
+    "output_filename": "synthwave_test.wav",
+    "session": "generation_test_runpod"
+  }
+}
