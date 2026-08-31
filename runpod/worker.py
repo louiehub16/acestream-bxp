@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""
-RunPod Serverless Worker — ACE-Step 1.5 xl-turbo on 24 GB (RTX 4090/3090/A10G).
-LAZY-HOT + R2 LOG-STREAMING.
-
-- Model init is LAZY (inside first handler) so the worker starts healthy.
-- Full stdout/stderr + model-init traceback streamed to R2 (logs/{job}.txt).
-- shift=3.0, pt backend, flash-attn off -> SDPA/eager.
-"""
+"""RunPod Serverless Worker — ACE-Step 1.5 xl-turbo on 24 GB.
+LAZY-HOT + R2 LOG-STREAMING. Model init lazy; full logs streamed to R2.
+shift=3.0, pt backend, flash-attn off (SDPA/eager)."""
 import io
 import json
 import os
@@ -37,12 +32,12 @@ _client = None
 _init_tb = None
 
 
-def _log_to_r2(key: str, text: str):
+def _log_to_r2(key, text):
     try:
         s3 = boto3.client("s3", endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_AKID,
                           aws_secret_access_key=R2_SAK, region_name="auto")
-        s3.put_object(Bucket=R2_BUCKET, Key=key, Body=text.encode("utf-8", "replace"),
-                      ContentType="text/plain")
+        s3.put_object(Bucket=R2_BUCKET, Key=key,
+                      Body=text.encode("utf-8", "replace"), ContentType="text/plain")
     except Exception:
         pass
 
@@ -71,6 +66,44 @@ def _ensure_warm():
             raise RuntimeError("model init failed (see R2 logs/{job}.txt for full traceback)")
 
 
+def _extract_audio_path(result):
+    """Return the audio file path (mp3/wav) from a /query_result result value."""
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            pass
+    if isinstance(result, list) and result:
+        for item in result:
+            if isinstance(item, dict):
+                f = item.get("file") or item.get("path") or item.get("audio_path")
+                if f:
+                    return f
+        for item in result:
+            if isinstance(item, dict) and isinstance(item.get("audio_paths"), list):
+                for p in item["audio_paths"]:
+                    if p:
+                        return p
+
+    def _find(obj, d=0):
+        if d > 6 or obj is None:
+            return None
+        if isinstance(obj, str) and obj.lower().endswith((".wav", ".mp3")):
+            return obj
+        if isinstance(obj, dict):
+            for v in obj.values():
+                f = _find(v, d + 1)
+                if f:
+                    return f
+        if isinstance(obj, list):
+            for v in obj:
+                f = _find(v, d + 1)
+                if f:
+                    return f
+        return None
+    return _find(result)
+
+
 def _render(prompt, lyrics, duration_s) -> bytes:
     c = _ensure_warm()
     r = c.post("/release_task", json={
@@ -81,6 +114,7 @@ def _render(prompt, lyrics, duration_s) -> bytes:
     task_id = data.get("task_id") or data.get("id")
     if not task_id:
         raise RuntimeError("no task_id")
+
     deadline = time.time() + 1800
     task = None
     while time.time() < deadline:
@@ -101,49 +135,14 @@ def _render(prompt, lyrics, duration_s) -> bytes:
     else:
         raise RuntimeError("gen timeout")
 
-    result = task.get("result", "")
-    audio_path = None
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except Exception:
-            result = None
-    # result is a list of items with a "file" (audio path) field (mp3/wav)
-    if isinstance(result, list) and result:
-        for item in result:
-            if isinstance(item, dict):
-                f = item.get("file") or item.get("path") or item.get("audio_path")
-                if f:
-                    audio_path = f
-                    break
-        if not audio_path:
-            for item in result:
-                if isinstance(item, dict) and isinstance(item.get("audio_paths"), list):
-                    for p in item["audio_paths"]:
-                        if p:
-                            audio_path = p
-                            break
-    if not audio_path:
-        def _find(obj, d=0):
-            if d > 6 or obj is None:
-                return None
-            if isinstance(obj, str) and (obj.lower().endswith((".wav", ".mp3"))):
-                return obj
-            if isinstance(obj, dict):
-                for v in obj.values():
-                    f = _find(v, d + 1)
-                    if f:
-                        return f
-            if isinstance(obj, list):
-                for v in obj:
-                    f = _find(v, d + 1)
-                    if f:
-                        return f
-            return None
-        audio_path = _find(result)
+    audio_path = _extract_audio_path(task.get("result", ""))
     if not audio_path:
         raise RuntimeError(f"no audio path in result: {str(task)[:400]}")
-    ar = c.get("/v1/audio", params={"path": audio_path})
+    # The result's file field may already be a full /v1/audio URL - use it directly.
+    if audio_path.startswith("/v1/"):
+        ar = c.get(audio_path)
+    else:
+        ar = c.get("/v1/audio", params={"path": audio_path})
     ar.raise_for_status()
     return ar.content
 
@@ -166,7 +165,7 @@ def handler(job):
 
     old_out, old_err = sys.stdout, sys.stderr
     buf = io.StringIO()
-    _log_lock = threading.Lock()
+    _ll = threading.Lock()
 
     class _Tee:
         def __init__(self, t_out, t_err, t_buf):
@@ -174,7 +173,7 @@ def handler(job):
             self._err = t_err
             self._buf = t_buf
         def write(self, s):
-            with _log_lock:
+            with _ll:
                 self._buf.write(s)
             try:
                 self._out.write(s)
@@ -191,7 +190,7 @@ def handler(job):
     sys.stderr = tee
 
     out = os.path.basename(output.replace("\\", "/"))
-    out = "".join(c for c in out if c.isalnum() or c in "._-") or "song.mp3"
+    out = "".join(ch for ch in out if ch.isalnum() or ch in "._-") or "song.mp3"
     if not out.lower().endswith((".wav", ".mp3")):
         out += ".mp3"
     key = f"{session}/{out}" if session else out
